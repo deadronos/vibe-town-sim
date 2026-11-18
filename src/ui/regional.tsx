@@ -28,6 +28,7 @@ let panel: Panel = {
   owned: [],
   houses: 0,
   population: 0,
+  economy: null,
 };
 const listeners = new Set<() => void>();
 const pending = new Map<number, (reply: Reply) => void>();
@@ -80,6 +81,9 @@ function App() {
   const [bridge, setBridge] = useState(false);
   const [anchor, setAnchor] = useState<Point[]>([]);
   const [selection, setSelection] = useState<Road | Parcel | Facility>();
+  const [detail, setDetail] = useState<Extract<Reply, { kind: "selection" }>>();
+  const [economyOpen, setEconomyOpen] = useState(false);
+  const [taxRate, setTaxRate] = useState(9);
   const [zone, setZone] = useState<Zone>("homes");
   const [side, setSide] = useState<Side>("both");
   const [brush, setBrush] = useState(false);
@@ -105,7 +109,10 @@ function App() {
         return;
       }
       const reply = await send({ kind: "select", roadId });
-      if (reply.kind === "selection") setSelection(reply.entity);
+      if (reply.kind === "selection") {
+        setSelection(reply.entity);
+        setDetail(reply);
+      }
       return;
     }
     if (tool === "zone") {
@@ -174,6 +181,7 @@ function App() {
 
   function choose(next: typeof tool) {
     setTool(next);
+    setEconomyOpen(false);
     setSelection(undefined);
     setAnchor([]);
     viewport?.preview([], bridge);
@@ -207,6 +215,7 @@ function App() {
     }
   }
 
+  const stats = city.economy;
   const roadSelection = selection && "points" in selection ? selection : undefined;
   const year = 1 + Math.floor(city.tick / 360);
   const day = 1 + (city.tick % 360);
@@ -263,21 +272,90 @@ function App() {
         </nav>
       </header>
       <aside className="inspector">
-        <small>{selection ? "NETWORK INSPECTOR" : "REGIONAL PLANNING"}</small>
+        <small>
+          {economyOpen ? "CITY ECONOMY" : selection ? "NETWORK INSPECTOR" : "REGIONAL PLANNING"}
+        </small>
         <h1>
-          {selection
-            ? `Address ${selection.id}`
-            : tool === "inspect"
-              ? "City overview"
-              : {
-                  straight: "Build roads",
-                  curve: "Build curves",
-                  zone: "Zone frontage",
-                  facility: "Public works",
-                  demolish: "Demolish",
-                }[tool]}
+          {economyOpen
+            ? "Demand and budget"
+            : selection
+              ? `Address ${selection.id}`
+              : tool === "inspect"
+                ? "City overview"
+                : {
+                    straight: "Build roads",
+                    curve: "Build curves",
+                    zone: "Zone frontage",
+                    facility: "Public works",
+                    demolish: "Demolish",
+                  }[tool]}
         </h1>
-        {roadSelection && tool === "inspect" ? (
+        {economyOpen && stats ? (
+          <>
+            <dl>
+              <dt>Jobs staffed</dt>
+              <dd>
+                {stats.staff} / {stats.jobs}
+              </dd>
+              <dt>Household workers</dt>
+              <dd>{stats.workers}</dd>
+              <dt>Household savings</dt>
+              <dd>${"{stats.savings.toLocaleString()}"}</dd>
+              <dt>Undeveloped lots</dt>
+              <dd>{stats.vacancies}</dd>
+              <dt>Goods sold</dt>
+              <dd>{stats.consumed}</dd>
+              <dt>Deliveries received</dt>
+              <dd>{stats.shipments}</dd>
+              <dt>Waiting for roads</dt>
+              <dd>{stats.queued}</dd>
+              <dt>Canceled trips</dt>
+              <dd>{stats.lost}</dd>
+              <dt>Booked income</dt>
+              <dd>${"{stats.receipts.toLocaleString()}"}</dd>
+              <dt>Booked spending</dt>
+              <dd>${"{stats.expenses.toLocaleString()}"}</dd>
+            </dl>
+            <label>
+              Tax rate{" "}
+              <input
+                type="range"
+                min="0"
+                max="30"
+                value={taxRate}
+                onChange={(event) => setTaxRate(Number(event.target.value))}
+              />{" "}
+              {taxRate}%
+            </label>
+            <p>
+              Projected monthly tax $
+              {
+                "{Math.floor(stats.residents * taxRate / 5 + stats.jobs * taxRate / 3).toLocaleString()}"
+              }{" "}
+              (before affordability)
+            </p>
+            <button
+              onClick={() =>
+                void request(
+                  { kind: "command", command: { kind: "tax", rate: taxRate } },
+                  "Tax rate applied",
+                )
+              }
+            >
+              Apply taxes
+            </button>
+            <details>
+              <summary>Recent ledger</summary>
+              <ul>
+                {stats.ledger.map((posting, i) => (
+                  <li key={i}>
+                    Day {posting.tick} · {posting.purpose} · ${"{posting.amount}"}
+                  </li>
+                ))}
+              </ul>
+            </details>
+          </>
+        ) : roadSelection && tool === "inspect" ? (
           <>
             <dl>
               <dt>Class</dt>
@@ -286,6 +364,10 @@ function App() {
               <dd>{Math.round(roadLength(roadSelection.points))} m</dd>
               <dt>Sidewalks</dt>
               <dd>{streets[roadSelection.kind].sidewalks ? "Yes" : "No"}</dd>
+              <dt>Queued trips</dt>
+              <dd>{detail?.traffic?.queued ?? 0}</dd>
+              <dt>Trips admitted today</dt>
+              <dd>{detail?.traffic?.admitted ?? 0}</dd>
               <dt>Water crossing</dt>
               <dd>{roadSelection.bridge ? "Bridge" : "None"}</dd>
             </dl>
@@ -313,6 +395,21 @@ function App() {
                 ))}
               </select>
             </label>
+            {roadSelection.kind === "highway" && (
+              <button
+                onClick={() =>
+                  void request(
+                    {
+                      kind: "command",
+                      command: { kind: "gateway", roadId: roadSelection.id },
+                    },
+                    "Outside connection enabled",
+                  )
+                }
+              >
+                Connect to region
+              </button>
+            )}
           </>
         ) : selection && !("points" in selection) && tool === "inspect" ? (
           <dl>
@@ -320,6 +417,28 @@ function App() {
             <dd>{"zone" in selection ? selection.zone : selection.service}</dd>
             <dt>Road</dt>
             <dd>{selection.roadId}</dd>
+            {detail?.home && (
+              <>
+                <dt>Residents</dt>
+                <dd>{detail.home.residents}</dd>
+                <dt>Workers</dt>
+                <dd>{detail.home.workers}</dd>
+                <dt>Savings</dt>
+                <dd>${"{detail.home.money}"}</dd>
+              </>
+            )}
+            {detail?.firm && (
+              <>
+                <dt>Staff</dt>
+                <dd>
+                  {detail.firm.staff} / {detail.firm.jobs}
+                </dd>
+                <dt>Inventory</dt>
+                <dd>{detail.firm.inventory}</dd>
+                <dt>Cash</dt>
+                <dd>${"{detail.firm.money}"}</dd>
+              </>
+            )}
             {"built" in selection && (
               <>
                 <dt>Developed</dt>
@@ -434,6 +553,24 @@ function App() {
       </aside>
       <footer className="dock">
         <p role="status">{notice}</p>
+        {stats && (
+          <div className="demand-bars" aria-label="Zone demand">
+            {Object.entries(stats.demand).map(([name, value]) => (
+              <button
+                key={name}
+                onClick={() => {
+                  choose("inspect");
+                  setEconomyOpen(!economyOpen);
+                  setTaxRate(stats.tax);
+                }}
+                aria-label={`${name} demand ${Math.round(value)} percent`}
+              >
+                {name}
+                <meter aria-label={name} min={0} max={100} value={value} />
+              </button>
+            ))}
+          </div>
+        )}
         <nav aria-label="Building tools">
           <button aria-pressed={tool === "inspect"} onClick={() => choose("inspect")}>
             Inspect

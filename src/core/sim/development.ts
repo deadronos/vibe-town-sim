@@ -145,11 +145,12 @@ export function suppliedParcels(city: Development, components = roadComponents(c
   return supplied;
 }
 
-export function develop(city: Development, supplied: Set<number>): void {
+export function develop(city: Development, supplied: Set<number>): boolean {
   for (const parcel of city.parcels) {
     if (!parcel.built && supplied.has(parcel.id)) {
       parcel.built = true;
-      return;
+      return true;
     }
   }
+  return false;
 }

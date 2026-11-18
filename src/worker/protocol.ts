@@ -1,4 +1,5 @@
 import type { City, Command, Result } from "../core/sim/city.ts";
+import type { economicSummary, Firm, Household } from "../core/sim/economy.ts";
 import type { Parcel, Facility } from "../core/sim/development.ts";
 import type { Road } from "../core/network/roads.ts";
 
@@ -19,6 +20,7 @@ export interface Panel {
   roadCount: number;
   houses: number;
   population: number;
+  economy: ReturnType<typeof economicSummary> | null;
   owned: string[];
 }
 export interface Scene {
@@ -33,5 +35,12 @@ export type Reply = { version: 1 } & (
   | { kind: "panel"; panel: Panel }
   | { kind: "scene"; scene: Scene }
   | { kind: "checkpoint"; id: number; checkpoint: City }
-  | { kind: "selection"; id: number; entity: Road | Parcel | Facility | undefined }
+  | {
+      kind: "selection";
+      id: number;
+      entity: Road | Parcel | Facility | undefined;
+      firm?: Firm;
+      home?: Household;
+      traffic?: { admitted: number; queued: number };
+    }
 );

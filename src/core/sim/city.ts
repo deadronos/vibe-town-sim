@@ -15,15 +15,23 @@ import {
   develop,
   frontage,
   services,
-  suppliedParcels,
   zones,
-  type Development,
   type Service,
   type Side,
   type Zone,
 } from "./development.ts";
 
-export interface City extends Development {
+import { planner } from "../network/routes.ts";
+import {
+  economicDay,
+  newEconomy,
+  prepareEconomy,
+  synchronizeEconomy,
+  transfer,
+  type EconomicCity,
+} from "./economy.ts";
+
+export interface City extends EconomicCity {
   version: 2;
   seed: number;
   revision: number;
@@ -37,7 +45,9 @@ export type Command =
   | { kind: "upgrade"; roadId: number; road: RoadClass }
   | { kind: "demolish"; id: number }
   | { kind: "zone"; roadId: number; zone: Zone; side: Side; brush?: Point }
-  | { kind: "facility"; at: Point; service: Service };
+  | { kind: "facility"; at: Point; service: Service }
+  | { kind: "tax"; rate: number }
+  | { kind: "gateway"; roadId: number };
 export type Result =
   | { ok: true; revision: number }
   | { ok: false; revision: number; reason: string };
@@ -50,6 +60,9 @@ export function createCity(seed: number): City {
     tick: 0,
     cash: 280_000,
     land: ["1,1"],
+    economy: newEconomy(),
+    tax: 9,
+    gateway: 0,
     parcels: [],
     facilities: [],
     nodes: [],
@@ -144,6 +157,67 @@ export function restore(raw: unknown): City {
   for (const facility of city.facilities) {
     if (!Object.hasOwn(services, facility.service)) throw new Error("Invalid facility");
   }
+  const economy = city.economy;
+  if (
+    !Number.isInteger(city.tax) ||
+    city.tax < 0 ||
+    city.tax > 30 ||
+    (city.gateway !== 0 && !city.roads.some((road) => road.id === city.gateway)) ||
+    !economy ||
+    !Array.isArray(economy.trips) ||
+    !Array.isArray(economy.ledger) ||
+    !economy.households ||
+    !economy.firms ||
+    !economy.balances ||
+    !economy.roadTraffic ||
+    ![
+      economy.receipts,
+      economy.expenses,
+      economy.consumed,
+      economy.produced,
+      economy.imported,
+      economy.exported,
+      economy.scrapped,
+      economy.payroll,
+      economy.commutes,
+      economy.deliveries,
+      economy.lost,
+      economy.queued,
+    ].every((value) => Number.isSafeInteger(value) && value >= 0)
+  )
+    throw new Error("Invalid economic checkpoint");
+  const parcelIds = new Set(
+    city.parcels.filter((parcel) => parcel.built).map((parcel) => parcel.id),
+  );
+  for (const account of [...Object.values(economy.households), ...Object.values(economy.firms)]) {
+    if (
+      !account ||
+      !parcelIds.has(account.id) ||
+      !Number.isSafeInteger(account.money) ||
+      account.money < 0
+    ) {
+      throw new Error("Invalid business or household account");
+    }
+  }
+  const roadIds = new Set(city.roads.map((road) => road.id));
+  for (const trip of economy.trips) {
+    if (
+      !trip ||
+      !parcelIds.has(trip.from) ||
+      !parcelIds.has(trip.to) ||
+      !Array.isArray(trip.edges) ||
+      !trip.edges.every((id) => roadIds.has(id)) ||
+      !Number.isSafeInteger(trip.edge) ||
+      trip.edge < 0 ||
+      trip.edge >= trip.edges.length ||
+      !Number.isSafeInteger(trip.due) ||
+      trip.due < 0 ||
+      !Number.isSafeInteger(trip.quantity) ||
+      trip.quantity < 1 ||
+      !["commute", "shopping", "shipment"].includes(trip.kind)
+    )
+      throw new Error("Invalid trip");
+  }
   return snapshot(city);
 }
 
@@ -152,10 +226,14 @@ export function execute(city: City, command: Command): Result {
   if (command.kind === "step") {
     if (!Number.isSafeInteger(command.count) || command.count < 1 || command.count > 100_000)
       return reject("Invalid step count");
-    const supplied = suppliedParcels(city);
+    const { router, supplied } = prepareEconomy(city);
     for (let day = 0; day < command.count; day++) {
       city.tick++;
-      if (city.tick % 3 === 0) develop(city, supplied);
+      if (city.tick % 3 === 0) {
+        const grown = develop(city, supplied);
+        if (grown) synchronizeEconomy(city, router);
+      }
+      economicDay(city, router, supplied);
     }
   } else if (command.kind === "road") {
     if (
@@ -207,7 +285,7 @@ export function execute(city: City, command: Command): Result {
       const segments = replaced.get(facility.roadId);
       if (segments) facility.roadId = nearestRoad(facility, segments)!.id;
     }
-    city.cash -= cost;
+    transfer(city, "city", "regional", cost, "Road construction");
   } else if (command.kind === "upgrade") {
     const road = city.roads.find((road) => road.id === command.roadId);
     if (!road || !Object.hasOwn(streets, command.road))
@@ -222,7 +300,7 @@ export function execute(city: City, command: Command): Result {
       roadLength(road.points) * Math.max(0, streets[command.road].cost - streets[road.kind].cost),
     );
     if (city.cash < cost) return reject("Insufficient upgrade funds");
-    city.cash -= cost;
+    transfer(city, "city", "regional", cost, "Road upgrade");
     road.kind = command.road;
   } else if (command.kind === "zone") {
     const road = city.roads.find((road) => road.id === command.roadId);
@@ -250,7 +328,7 @@ export function execute(city: City, command: Command): Result {
     );
     if (site) return reject("Facility site is occupied");
     if (city.cash < services[command.service].cost) return reject("Insufficient facility funds");
-    city.cash -= services[command.service].cost;
+    transfer(city, "city", "regional", services[command.service].cost, "Facility construction");
     city.facilities.push({
       ...command.at,
       id: city.nextId++,
@@ -260,6 +338,7 @@ export function execute(city: City, command: Command): Result {
   } else if (command.kind === "demolish") {
     const road = city.roads.find((road) => road.id === command.id);
     if (road) {
+      if (road.id === city.gateway) city.gateway = 0;
       city.roads = city.roads.filter((segment) => segment.id !== road.id);
       city.parcels = city.parcels.filter((parcel) => parcel.roadId !== road.id);
       city.facilities = city.facilities.filter((facility) => facility.roadId !== road.id);
@@ -270,9 +349,21 @@ export function execute(city: City, command: Command): Result {
     } else {
       return reject("Choose an existing road, parcel, or facility");
     }
+  } else if (command.kind === "tax") {
+    if (!Number.isInteger(command.rate) || command.rate < 0 || command.rate > 30)
+      return reject("Tax rate must be 0–30%");
+    city.tax = command.rate;
+  } else if (command.kind === "gateway") {
+    const road = city.roads.find((road) => road.id === command.roadId);
+    if (road?.kind !== "highway") return reject("Choose a highway for the regional connection");
+    if (!road.points.some((point) => point.x < -1_750 || point.z < -1_750))
+      return reject("Connect a highway to the western or southern starter-area boundary");
+    city.gateway = road.id;
   } else {
     return reject("Unknown command");
   }
+  if (command.kind === "road" || command.kind === "demolish")
+    synchronizeEconomy(city, planner(city));
   city.revision++;
   return { ok: true, revision: city.revision };
 }

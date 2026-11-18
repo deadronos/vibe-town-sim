@@ -1,8 +1,10 @@
 import { createCity, execute, restore, snapshot } from "../core/sim/city.ts";
+import { economicSummary } from "../core/sim/economy.ts";
 import { zones } from "../core/sim/development.ts";
 import { PROTOCOL, type Reply, type Request } from "./protocol.ts";
 
 let city = createCity(7);
+let publishedBuildings = -1;
 let speed: 0 | 1 | 4 | 16 = 0;
 
 function post(
@@ -29,10 +31,14 @@ function publish(topology = false): void {
       roadCount: roads.length,
       owned: land,
       houses: buildings.length,
+      economy: economicSummary(city),
       population: buildings.reduce((sum, parcel) => sum + zones[parcel.zone].residents, 0),
     },
   });
-  if (topology) post({ kind: "scene", scene: { seed, revision, roads, parcels, facilities } });
+  if (topology || publishedBuildings !== buildings.length) {
+    post({ kind: "scene", scene: { seed, revision, roads, parcels, facilities } });
+    publishedBuildings = buildings.length;
+  }
 }
 
 self.onmessage = ({ data }: MessageEvent<Request>) => {
@@ -46,6 +52,9 @@ self.onmessage = ({ data }: MessageEvent<Request>) => {
     post({
       kind: "selection",
       id,
+      firm: city.economy.firms[data.roadId],
+      home: city.economy.households[data.roadId],
+      traffic: city.economy.roadTraffic[data.roadId],
       entity: [...city.roads, ...city.parcels, ...city.facilities].find(
         (item) => item.id === data.roadId,
       ),
@@ -82,5 +91,5 @@ self.onmessage = ({ data }: MessageEvent<Request>) => {
 setInterval(() => {
   if (speed === 0) return;
   execute(city, { kind: "step", count: speed });
-  publish(true);
+  publish();
 }, 250);
