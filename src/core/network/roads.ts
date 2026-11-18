@@ -32,6 +32,23 @@ export function roadElevation(seed: number, point: Point, bridge: boolean): numb
   return Math.max(bridge ? WATER + 5 : -100, height(seed, point)) + 0.8;
 }
 
+export function segmentElevation(
+  seed: number,
+  points: Point[],
+  index: number,
+  t: number,
+  bridge: boolean,
+): number {
+  const start = points[index - 1];
+  const end = points[index];
+  if (!bridge) return roadElevation(seed, mix(start, end, t), false);
+  const offset = roadLength(points.slice(0, index)) + distance(start, end) * t;
+  const fraction = offset / roadLength(points);
+  const a = roadElevation(seed, points[0], true);
+  const b = roadElevation(seed, points.at(-1)!, true);
+  return a + (b - a) * fraction;
+}
+
 export function closestPoint(point: Point, a: Point, b: Point): { point: Point; t: number } {
   const dx = b.x - a.x;
   const dz = b.z - a.z;

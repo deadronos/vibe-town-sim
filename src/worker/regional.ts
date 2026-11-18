@@ -1,6 +1,7 @@
 import { createCity, execute, restore, snapshot } from "../core/sim/city.ts";
 import { economicSummary } from "../core/sim/economy.ts";
-import { zones } from "../core/sim/development.ts";
+import { regionSummary } from "../core/sim/region.ts";
+import { suppliedParcels, zones } from "../core/sim/development.ts";
 import { PROTOCOL, type Reply, type Request } from "./protocol.ts";
 
 let city = createCity(7);
@@ -32,11 +33,24 @@ function publish(topology = false): void {
       owned: land,
       houses: buildings.length,
       economy: economicSummary(city),
+      region: regionSummary(city),
       population: buildings.reduce((sum, parcel) => sum + zones[parcel.zone].residents, 0),
     },
   });
   if (topology || publishedBuildings !== buildings.length) {
-    post({ kind: "scene", scene: { seed, revision, roads, parcels, facilities } });
+    post({
+      kind: "scene",
+      scene: {
+        seed,
+        revision,
+        roads,
+        parcels,
+        facilities,
+        stops: city.region.stops,
+        lines: city.region.lines,
+        supplied: [...suppliedParcels(city)],
+      },
+    });
     publishedBuildings = buildings.length;
   }
 }
@@ -55,7 +69,7 @@ self.onmessage = ({ data }: MessageEvent<Request>) => {
       firm: city.economy.firms[data.roadId],
       home: city.economy.households[data.roadId],
       traffic: city.economy.roadTraffic[data.roadId],
-      entity: [...city.roads, ...city.parcels, ...city.facilities].find(
+      entity: [...city.roads, ...city.parcels, ...city.facilities, ...city.region.stops].find(
         (item) => item.id === data.roadId,
       ),
     });

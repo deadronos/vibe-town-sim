@@ -202,3 +202,30 @@ dd {
   height: 0.38rem;
   accent-color: var(--accent);
 }
+.inspector table {
+  width: 100%;
+  text-align: left;
+  border-spacing: 0.25rem;
+}
+.inspector td {
+  text-transform: capitalize;
+}
+.inspector dl > div {
+  display: contents;
+}
+.inspector label > input:not([type="checkbox"]):not([type="range"]) {
+  display: block;
+  width: 100%;
+  padding: 0.35rem;
+  font: inherit;
+}
+.inspector button:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+.stop-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.3rem;
+  margin-bottom: 0.7rem;
+}

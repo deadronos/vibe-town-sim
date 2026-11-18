@@ -1,3 +1,4 @@
+import type { regionSummary, Stop, Line } from "../core/sim/region.ts";
 import type { City, Command, Result } from "../core/sim/city.ts";
 import type { economicSummary, Firm, Household } from "../core/sim/economy.ts";
 import type { Parcel, Facility } from "../core/sim/development.ts";
@@ -21,6 +22,7 @@ export interface Panel {
   houses: number;
   population: number;
   economy: ReturnType<typeof economicSummary> | null;
+  region: ReturnType<typeof regionSummary> | null;
   owned: string[];
 }
 export interface Scene {
@@ -29,6 +31,9 @@ export interface Scene {
   roads: Road[];
   parcels: Parcel[];
   facilities: Facility[];
+  stops: Stop[];
+  lines: Line[];
+  supplied: number[];
 }
 export type Reply = { version: 1 } & (
   | { kind: "ack"; id: number; result: Result }
@@ -38,7 +43,7 @@ export type Reply = { version: 1 } & (
   | {
       kind: "selection";
       id: number;
-      entity: Road | Parcel | Facility | undefined;
+      entity: Road | Parcel | Facility | Stop | undefined;
       firm?: Firm;
       home?: Household;
       traffic?: { admitted: number; queued: number };

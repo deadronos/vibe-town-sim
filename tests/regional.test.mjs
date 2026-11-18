@@ -165,3 +165,62 @@ test("a road cut stops arrivals, rerouting restores sales, and inventory and cas
   );
   assert.equal(city.cash, 280_000 + city.economy.receipts - city.economy.expenses);
 });
+
+test("river expansion adds service demand and a bus moves queued commuter cohorts", () => {
+  const city = createCity(7);
+  const act = (command) => {
+    const reply = execute(city, command);
+    assert.ok(reply.ok, JSON.stringify(reply));
+  };
+  const road = (points, bridge = false) => {
+    act({ kind: "road", points, road: "avenue", bridge });
+    return city.roads.at(-1).id;
+  };
+  act({ kind: "purchase", tile: "2,1" });
+  const west = road([
+    { x: -480, z: -570 },
+    { x: -195, z: -570 },
+  ]);
+  road(
+    [
+      { x: -195, z: -570 },
+      { x: 445, z: -570 },
+    ],
+    true,
+  );
+  const east = road([
+    { x: 445, z: -570 },
+    { x: 830, z: -570 },
+  ]);
+  act({ kind: "zone", roadId: west, zone: "towers", side: "both" });
+  act({ kind: "zone", roadId: east, zone: "offices", side: "both" });
+  act({ kind: "facility", at: { x: -400, z: -465 }, service: "power" });
+  act({ kind: "facility", at: { x: -365, z: -465 }, service: "water" });
+  act({ kind: "step", count: 90 });
+  assert.equal(
+    city.parcels.some((lot) => lot.built),
+    false,
+  );
+  act({ kind: "facility", at: { x: -330, z: -465 }, service: "sewage" });
+  act({ kind: "facility", at: { x: 730, z: -465 }, service: "sewage" });
+  act({ kind: "facility", at: { x: 695, z: -465 }, service: "power" });
+  act({ kind: "facility", at: { x: 660, z: -465 }, service: "water" });
+  act({ kind: "facility", at: { x: 625, z: -465 }, service: "garbage" });
+  act({ kind: "district", tile: "2,1", name: "East Bank", tax: 12, budget: 100 });
+  act({ kind: "step", count: 90 });
+  assert.ok(city.economy.commutes > 0);
+  assert.ok(city.region.response.garbage > 0);
+  const stops = [];
+  for (const at of [
+    { x: -325, z: -570 },
+    { x: 620, z: -570 },
+  ]) {
+    act({ kind: "stop", at });
+    stops.push(city.region.stops.at(-1).id);
+  }
+  act({ kind: "line", line: "bus", stops });
+  act({ kind: "step", count: 90 });
+  assert.ok(city.region.lines[0].riders > 0);
+  assert.equal(city.region.districts["2,1"].name, "East Bank");
+  assert.deepEqual(restore(snapshot(city)), city);
+});

@@ -1,3 +1,12 @@
+import { landId } from "../world/terrain.ts";
+import {
+  chooseLine,
+  LAND_UPKEEP,
+  scheduleResponse,
+  vehicles,
+  type PublicService,
+  type RegionalCity,
+} from "./region.ts";
 import { planner, travelDays } from "../network/routes.ts";
 import { roadComponents, streets } from "../network/roads.ts";
 import { services, suppliedParcels, zones, type Development, type Parcel } from "./development.ts";
@@ -27,7 +36,8 @@ export interface Trip {
   edge: number;
   due: number;
   quantity: number;
-  mode: "road" | "bus" | "rail";
+  mode: "road" | "bus" | "tram";
+  returning?: boolean;
   line?: number;
 }
 export interface Posting {
@@ -122,15 +132,23 @@ export function transfer(
   if (economy.ledger.length > 80) economy.ledger.shift();
 }
 
-type Router = ReturnType<typeof planner>;
+export type Router = ReturnType<typeof planner>;
 
-export function synchronizeEconomy(city: EconomicCity, router: Router): void {
+export function synchronizeEconomy(city: RegionalCity, router: Router): void {
   const { economy } = city;
   const active = new Map(city.parcels.filter((lot) => lot.built).map((lot) => [lot.id, lot]));
   for (const trip of economy.trips) {
     const from = active.get(trip.from);
     const to = active.get(trip.to);
-    const path = from && to && router.route(from.roadId, to.roadId);
+    const facility =
+      trip.kind === "dispatch" ? city.facilities.find((item) => item.id === trip.from) : undefined;
+    const origin = from ?? facility;
+    let path = origin && to && router.route(origin.roadId, to.roadId);
+    if (trip.returning && path) path = [...path].reverse();
+    if (trip.line !== undefined && path && from && to) {
+      const transit = chooseLine(city, router, from, to, path);
+      path = transit?.line.id === trip.line ? transit.edges : undefined;
+    }
     if (
       path &&
       path.length === trip.edges.length &&
@@ -181,18 +199,47 @@ export function synchronizeEconomy(city: EconomicCity, router: Router): void {
 }
 
 function start(
-  city: EconomicCity,
+  city: RegionalCity,
   kind: TripKind,
   from: Parcel,
   to: Parcel,
   edges: number[],
   quantity: number,
+  router: Router,
+): void {
+  const transit =
+    kind === "commute" || kind === "shopping"
+      ? chooseLine(city, router, from, to, edges)
+      : undefined;
+  const seats = transit ? vehicles[transit.line.kind].seats : quantity;
+  for (let remaining = quantity; remaining > 0; remaining -= seats) {
+    city.economy.trips.push({
+      id: city.nextId++,
+      kind,
+      from: from.id,
+      to: to.id,
+      edges: transit?.edges ?? edges,
+      edge: 0,
+      due: 0,
+      quantity: Math.min(remaining, seats),
+      mode: transit?.line.kind ?? "road",
+      line: transit?.line.id,
+    });
+  }
+}
+
+export function startDispatch(
+  city: RegionalCity,
+  from: number,
+  to: number,
+  edges: number[],
+  quantity: number,
 ): void {
   city.economy.trips.push({
     id: city.nextId++,
-    kind,
-    from: from.id,
-    to: to.id,
+    kind: "dispatch",
+    from,
+    to,
     edges,
     edge: 0,
     due: 0,
@@ -201,8 +248,18 @@ function start(
   });
 }
 
-function finish(city: EconomicCity, trip: Trip): void {
+function finish(city: RegionalCity, trip: Trip): boolean {
   const { economy } = city;
+  if (trip.kind === "dispatch" && !trip.returning) {
+    const facility = city.facilities.find((item) => item.id === trip.from)!;
+    const service = facility.service as PublicService;
+    city.region.response[service] += trip.quantity;
+    city.region.visited[`${service}:${trip.to}`] = city.tick;
+    trip.returning = true;
+    trip.edges = [...trip.edges].reverse();
+    trip.edge = 0;
+    return true;
+  }
   const from = economy.households[trip.from];
   const to = economy.firms[trip.to];
   if (trip.kind === "commute" && from && to) {
@@ -223,16 +280,24 @@ function finish(city: EconomicCity, trip: Trip): void {
     economy.consumed += quantity;
     transfer(city, `home:${from.id}`, `firm:${to.id}`, quantity * 6, "Goods retail");
   }
+  return false;
 }
 
-function advanceTrips(city: EconomicCity, router: Router): void {
+function advanceTrips(city: RegionalCity, router: Router): void {
   const { economy, tick } = city;
   economy.roadTraffic = {};
   economy.queued = 0;
   const active: Trip[] = [];
   const occupied = new Map<number, number>();
+  const lines = new Map(
+    city.region.lines.map((line) => {
+      line.waiting = 0;
+      return [line.id, line];
+    }),
+  );
+  const boarding = new Map<number, number>();
   for (const trip of economy.trips) {
-    if (trip.due > tick)
+    if (trip.due > tick && trip.mode === "road")
       occupied.set(trip.edges[trip.edge], (occupied.get(trip.edges[trip.edge]) ?? 0) + 1);
   }
   for (const trip of economy.trips) {
@@ -244,11 +309,27 @@ function advanceTrips(city: EconomicCity, router: Router): void {
       trip.edge++;
       trip.due = 0;
       if (trip.edge === trip.edges.length) {
-        finish(city, trip);
-        continue;
+        if (!finish(city, trip)) continue;
       }
     }
     const road = router.roads.get(trip.edges[trip.edge])!;
+    const line = trip.line === undefined ? undefined : lines.get(trip.line);
+    if (line) {
+      const vehicle = vehicles[line.kind];
+      const boarded = boarding.get(line.id) ?? 0;
+      if (trip.edge > 0) {
+        trip.due = tick + Math.ceil(travelDays(road) / vehicle.speed);
+      } else if (tick % vehicle.headway === 0 && boarded + trip.quantity <= vehicle.seats) {
+        line.riders += trip.quantity;
+        boarding.set(line.id, boarded + trip.quantity);
+        trip.due = tick + Math.ceil(travelDays(road) / vehicle.speed);
+      } else {
+        line.waiting += trip.quantity;
+        line.waitDays += trip.quantity;
+      }
+      active.push(trip);
+      continue;
+    }
     const load = occupied.get(road.id) ?? 0;
     const status = economy.roadTraffic[road.id] ?? { admitted: 0, queued: 0 };
     if (load < streets[road.kind].capacity) {
@@ -265,7 +346,7 @@ function advanceTrips(city: EconomicCity, router: Router): void {
   economy.trips = active;
 }
 
-export function economicDay(city: EconomicCity, router: Router, supplied: Set<number>): void {
+export function economicDay(city: RegionalCity, router: Router, supplied: Set<number>): void {
   const { economy, tick } = city;
   const lots = new Map(city.parcels.map((lot) => [lot.id, lot]));
   const firms = Object.values(economy.firms).filter((firm) => supplied.has(firm.id));
@@ -278,6 +359,7 @@ export function economicDay(city: EconomicCity, router: Router, supplied: Set<nu
     gateway !== undefined && components?.get(lot.roadId) === gateway;
 
   advanceTrips(city, router);
+  scheduleResponse(city, router);
   for (const factory of factories) {
     const capacity = Math.max(0, Math.min(100 - factory.inventory, factory.staff));
     factory.inventory += capacity;
@@ -320,7 +402,7 @@ export function economicDay(city: EconomicCity, router: Router, supplied: Set<nu
           available,
           candidate.firm.jobs - (assigned.get(candidate.firm.id) ?? 0),
         );
-        start(city, "commute", origin, candidate.lot, candidate.edges, quantity);
+        start(city, "commute", origin, candidate.lot, candidate.edges, quantity, router);
         assigned.set(candidate.firm.id, (assigned.get(candidate.firm.id) ?? 0) + quantity);
         available -= quantity;
         if (available === 0) break;
@@ -349,7 +431,7 @@ export function economicDay(city: EconomicCity, router: Router, supplied: Set<nu
         const quantity = Math.min(28, factory.inventory, Math.floor(shop.money / 2));
         factory.inventory -= quantity;
         transfer(city, `firm:${shop.id}`, "cargo", quantity * 2, "Wholesale order");
-        start(city, "shipment", origin, target, edges, quantity);
+        start(city, "shipment", origin, target, edges, quantity, router);
         ordered = true;
         break;
       }
@@ -371,7 +453,15 @@ export function economicDay(city: EconomicCity, router: Router, supplied: Set<nu
         const target = lots.get(shop.id)!;
         const edges = router.route(origin.roadId, target.roadId);
         if (!edges) continue;
-        start(city, "shopping", origin, target, edges, Math.max(1, Math.floor(home.residents / 6)));
+        start(
+          city,
+          "shopping",
+          origin,
+          target,
+          edges,
+          Math.max(1, Math.floor(home.residents / 6)),
+          router,
+        );
         break;
       }
     }
@@ -387,7 +477,8 @@ export function economicDay(city: EconomicCity, router: Router, supplied: Set<nu
       }
     }
     for (const home of homes) {
-      const propertyBill = Math.floor((home.residents * city.tax) / 5);
+      const rate = city.region.districts[landId(lots.get(home.id)!)]?.tax ?? city.tax;
+      const propertyBill = Math.floor((home.residents * rate) / 5);
       const tax = Math.min(propertyBill, home.money);
       transfer(city, `home:${home.id}`, "city", tax, "Household taxes");
       transfer(
@@ -408,18 +499,26 @@ export function economicDay(city: EconomicCity, router: Router, supplied: Set<nu
           "Regional professional services",
         );
       }
-      const tax = Math.min(Math.floor((firm.jobs * city.tax) / 3), firm.money);
+      const rate = city.region.districts[landId(lots.get(firm.id)!)]?.tax ?? city.tax;
+      const tax = Math.min(Math.floor((firm.jobs * rate) / 3), firm.money);
       transfer(city, `firm:${firm.id}`, "city", tax, "Business taxes");
     }
+    const transitCost = city.region.lines.reduce(
+      (sum, line) => sum + vehicles[line.kind].upkeep * 30,
+      0,
+    );
     const upkeep = city.facilities.reduce(
-      (sum, facility) => sum + services[facility.service].upkeep * 30,
-      city.roads.length * 9 + (city.land.length - 1) * 120,
+      (sum, facility) => {
+        const budget = city.region.districts[landId(facility)]?.budget ?? 100;
+        return sum + Math.floor((services[facility.service].upkeep * 30 * budget) / 100);
+      },
+      city.roads.length * 9 + (city.land.length - 1) * LAND_UPKEEP + transitCost,
     );
     transfer(city, "city", "regional", upkeep, "Monthly infrastructure operations");
   }
 }
 
-export function prepareEconomy(city: EconomicCity) {
+export function prepareEconomy(city: RegionalCity) {
   const router = planner(city);
   const supplied = suppliedParcels(city);
   synchronizeEconomy(city, router);

@@ -3,7 +3,7 @@ import {
   addRoad,
   closestPoint,
   nearestRoad,
-  roadElevation,
+  segmentElevation,
   roadLength,
   snap,
   streets,
@@ -28,10 +28,18 @@ import {
   prepareEconomy,
   synchronizeEconomy,
   transfer,
-  type EconomicCity,
 } from "./economy.ts";
 
-export interface City extends EconomicCity {
+import {
+  adjacent,
+  LAND_COST,
+  newRegion,
+  vehicles,
+  type LineKind,
+  type RegionalCity,
+} from "./region.ts";
+
+export interface City extends RegionalCity {
   version: 2;
   seed: number;
   revision: number;
@@ -47,7 +55,11 @@ export type Command =
   | { kind: "zone"; roadId: number; zone: Zone; side: Side; brush?: Point }
   | { kind: "facility"; at: Point; service: Service }
   | { kind: "tax"; rate: number }
-  | { kind: "gateway"; roadId: number };
+  | { kind: "gateway"; roadId: number }
+  | { kind: "purchase"; tile: string }
+  | { kind: "district"; tile: string; name: string; tax: number; budget: number }
+  | { kind: "stop"; at: Point }
+  | { kind: "line"; line: LineKind; stops: number[] };
 export type Result =
   | { ok: true; revision: number }
   | { ok: false; revision: number; reason: string };
@@ -61,6 +73,7 @@ export function createCity(seed: number): City {
     cash: 280_000,
     land: ["1,1"],
     economy: newEconomy(),
+    region: newRegion(),
     tax: 9,
     gateway: 0,
     parcels: [],
@@ -200,10 +213,39 @@ export function restore(raw: unknown): City {
     }
   }
   const roadIds = new Set(city.roads.map((road) => road.id));
+  if (
+    !city.region ||
+    !Array.isArray(city.region.stops) ||
+    !Array.isArray(city.region.lines) ||
+    !city.region.districts ||
+    !city.region.response ||
+    !city.region.visited
+  )
+    throw new Error("Invalid regional services");
+  for (const stop of city.region.stops) {
+    if (!validPoint(stop) || !roadIds.has(stop.roadId) || !validIdentity(stop.id, city, ids))
+      throw new Error("Invalid stop");
+    ids.add(stop.id);
+  }
+  const stopIds = new Set(city.region.stops.map((stop) => stop.id));
+  for (const line of city.region.lines) {
+    if (
+      !line ||
+      !validIdentity(line.id, city, ids) ||
+      !Object.hasOwn(vehicles, line.kind) ||
+      !Array.isArray(line.stops) ||
+      line.stops.length < 2 ||
+      !line.stops.every((stop) => stopIds.has(stop)) ||
+      ![line.riders, line.waiting, line.waitDays].every(Number.isSafeInteger)
+    )
+      throw new Error("Invalid transit line");
+    ids.add(line.id);
+  }
+  const facilityIds = new Set(city.facilities.map((item) => item.id));
   for (const trip of economy.trips) {
     if (
       !trip ||
-      !parcelIds.has(trip.from) ||
+      !(trip.kind === "dispatch" ? facilityIds.has(trip.from) : parcelIds.has(trip.from)) ||
       !parcelIds.has(trip.to) ||
       !Array.isArray(trip.edges) ||
       !trip.edges.every((id) => roadIds.has(id)) ||
@@ -214,9 +256,13 @@ export function restore(raw: unknown): City {
       trip.due < 0 ||
       !Number.isSafeInteger(trip.quantity) ||
       trip.quantity < 1 ||
-      !["commute", "shopping", "shipment"].includes(trip.kind)
+      !["commute", "shopping", "shipment", "dispatch"].includes(trip.kind) ||
+      (trip.mode !== "road" &&
+        !city.region.lines.some((line) => line.id === trip.line && line.kind === trip.mode)) ||
+      !validIdentity(trip.id, city, ids)
     )
       throw new Error("Invalid trip");
+    ids.add(trip.id);
   }
   return snapshot(city);
 }
@@ -266,8 +312,8 @@ export function execute(city: City, command: Command): Result {
           return reject("A bridge is required over water");
         const grade =
           Math.abs(
-            roadElevation(city.seed, point, !!command.bridge) -
-              roadElevation(city.seed, previous, !!command.bridge),
+            segmentElevation(city.seed, points, i, j / samples, !!command.bridge) -
+              segmentElevation(city.seed, points, i, (j - 1) / samples, !!command.bridge),
           ) / distance(point, previous);
         if (grade > 0.19) return reject("Road grade exceeds 19%");
         previous = point;
@@ -284,6 +330,10 @@ export function execute(city: City, command: Command): Result {
     for (const facility of city.facilities) {
       const segments = replaced.get(facility.roadId);
       if (segments) facility.roadId = nearestRoad(facility, segments)!.id;
+    }
+    for (const stop of city.region.stops) {
+      const segments = replaced.get(stop.roadId);
+      if (segments) stop.roadId = nearestRoad(stop, segments)!.id;
     }
     transfer(city, "city", "regional", cost, "Road construction");
   } else if (command.kind === "upgrade") {
@@ -342,12 +392,21 @@ export function execute(city: City, command: Command): Result {
       city.roads = city.roads.filter((segment) => segment.id !== road.id);
       city.parcels = city.parcels.filter((parcel) => parcel.roadId !== road.id);
       city.facilities = city.facilities.filter((facility) => facility.roadId !== road.id);
+      city.region.stops = city.region.stops.filter((stop) => stop.roadId !== road.id);
+      city.region.lines = city.region.lines.filter((line) =>
+        line.stops.every((id) => city.region.stops.some((stop) => stop.id === id)),
+      );
     } else if (city.parcels.some((parcel) => parcel.id === command.id)) {
       city.parcels = city.parcels.filter((parcel) => parcel.id !== command.id);
     } else if (city.facilities.some((facility) => facility.id === command.id)) {
       city.facilities = city.facilities.filter((facility) => facility.id !== command.id);
+    } else if (city.region.lines.some((line) => line.id === command.id)) {
+      city.region.lines = city.region.lines.filter((line) => line.id !== command.id);
+    } else if (city.region.stops.some((stop) => stop.id === command.id)) {
+      city.region.stops = city.region.stops.filter((stop) => stop.id !== command.id);
+      city.region.lines = city.region.lines.filter((line) => !line.stops.includes(command.id));
     } else {
-      return reject("Choose an existing road, parcel, or facility");
+      return reject("Choose an existing road, parcel, facility, stop, or line");
     }
   } else if (command.kind === "tax") {
     if (!Number.isInteger(command.rate) || command.rate < 0 || command.rate > 30)
@@ -359,6 +418,70 @@ export function execute(city: City, command: Command): Result {
     if (!road.points.some((point) => point.x < -1_750 || point.z < -1_750))
       return reject("Connect a highway to the western or southern starter-area boundary");
     city.gateway = road.id;
+  } else if (command.kind === "purchase") {
+    if (!adjacent(city.land, command.tile)) return reject("Choose unowned land next to your city");
+    if (city.cash < LAND_COST) return reject("Insufficient land purchase funds");
+    city.land.push(command.tile);
+    transfer(city, "city", "regional", LAND_COST, "Land purchase");
+  } else if (command.kind === "district") {
+    if (
+      !city.land.includes(command.tile) ||
+      typeof command.name !== "string" ||
+      command.name.trim().length < 1 ||
+      command.name.length > 40 ||
+      !Number.isInteger(command.tax) ||
+      command.tax < 0 ||
+      command.tax > 30 ||
+      !Number.isInteger(command.budget) ||
+      command.budget < 0 ||
+      command.budget > 150
+    )
+      return reject("Invalid district policy");
+    city.region.districts[command.tile] = {
+      name: command.name.trim(),
+      tax: command.tax,
+      budget: command.budget,
+    };
+  } else if (command.kind === "stop") {
+    if (!validPoint(command.at)) return reject("Choose a stop location");
+    const road = nearestRoad(command.at, city.roads);
+    if (!road || road.kind === "highway") return reject("Stops need a street or avenue");
+    const site = frontagePoint(command.at, road);
+    if (
+      distance(command.at, site) > 28 ||
+      city.region.stops.some((stop) => distance(stop, site) < 36)
+    ) {
+      return reject("Place stops on a road and at least 36 m apart");
+    }
+    if (city.cash < 1_500) return reject("Insufficient stop funds");
+    city.region.stops.push({ ...site, id: city.nextId++, roadId: road.id });
+    transfer(city, "city", "regional", 1_500, "Transit stop construction");
+  } else if (command.kind === "line") {
+    if (
+      !Object.hasOwn(vehicles, command.line) ||
+      !Array.isArray(command.stops) ||
+      command.stops.length < 2 ||
+      command.stops.length > 20 ||
+      new Set(command.stops).size !== command.stops.length
+    )
+      return reject("Choose two or more different stops");
+    const stops = command.stops.map((id) => city.region.stops.find((stop) => stop.id === id));
+    const router = planner(city);
+    if (
+      stops.some((stop, i) => !stop || (i > 0 && !router.route(stops[i - 1]!.roadId, stop.roadId)))
+    )
+      return reject("Stops must be connected");
+    const cost = vehicles[command.line].construction;
+    if (city.cash < cost) return reject("Insufficient line construction funds");
+    city.region.lines.push({
+      id: city.nextId++,
+      kind: command.line,
+      stops: [...command.stops],
+      riders: 0,
+      waiting: 0,
+      waitDays: 0,
+    });
+    transfer(city, "city", "regional", cost, "Transit line construction");
   } else {
     return reject("Unknown command");
   }
@@ -373,4 +496,8 @@ function frontagePoint(point: Point, road: Road): Point {
     .slice(1)
     .map((end, i) => closestPoint(point, road.points[i], end).point)
     .reduce((closest, next) => (distance(point, next) < distance(point, closest) ? next : closest));
+}
+
+function validIdentity(id: number, city: City, ids: Set<number>): boolean {
+  return Number.isSafeInteger(id) && id > 0 && id < city.nextId && !ids.has(id);
 }

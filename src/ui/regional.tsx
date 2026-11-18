@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { createRoot } from "react-dom/client";
-import { distance, mix, type Point } from "../core/world/terrain.ts";
+import { distance, landId, mix, type Point } from "../core/world/terrain.ts";
 import { roadLength, streets, type Road, type RoadClass } from "../core/network/roads.ts";
 import {
   services,
@@ -13,7 +13,10 @@ import {
 } from "../core/sim/development.ts";
 import { PROTOCOL, type Panel, type Reply, type Request } from "../worker/protocol.ts";
 import { readCheckpoint, writeCheckpoint } from "../storage/regional.ts";
-import { createViewport } from "../view/regional.ts";
+import type { Stop } from "../core/sim/region.ts";
+import type { Command } from "../core/sim/city.ts";
+import { LandPanel, LayersPanel, TransitPanel } from "./region-panel.tsx";
+import { createViewport, type Layer } from "../view/regional.ts";
 import "./regional.css";
 
 type WithoutEnvelope<T> = T extends unknown ? Omit<T, "version" | "id"> : never;
@@ -29,6 +32,7 @@ let panel: Panel = {
   houses: 0,
   population: 0,
   economy: null,
+  region: null,
 };
 const listeners = new Set<() => void>();
 const pending = new Map<number, (reply: Reply) => void>();
@@ -75,12 +79,22 @@ function download(value: unknown): void {
 function App() {
   const city = useSyncExternalStore(subscribe, () => panel);
   const [tool, setTool] = useState<
-    "inspect" | "straight" | "curve" | "zone" | "facility" | "demolish"
+    | "inspect"
+    | "straight"
+    | "curve"
+    | "zone"
+    | "facility"
+    | "demolish"
+    | "land"
+    | "transit"
+    | "layers"
   >("inspect");
   const [road, setRoad] = useState<RoadClass>("street");
   const [bridge, setBridge] = useState(false);
   const [anchor, setAnchor] = useState<Point[]>([]);
-  const [selection, setSelection] = useState<Road | Parcel | Facility>();
+  const [selection, setSelection] = useState<Road | Parcel | Facility | Stop>();
+  const [tile, setTile] = useState("1,1");
+  const [layer, setLayer] = useState<Layer>("none");
   const [detail, setDetail] = useState<Extract<Reply, { kind: "selection" }>>();
   const [economyOpen, setEconomyOpen] = useState(false);
   const [taxRate, setTaxRate] = useState(9);
@@ -102,8 +116,23 @@ function App() {
     return reply.result.ok;
   }
 
+  function run(command: Command, message: string) {
+    return request({ kind: "command", command }, message);
+  }
+
   onMap.current = async (point, roadId) => {
-    if (tool === "inspect") {
+    if (tool === "land") {
+      const picked = landId(point);
+      setTile(picked);
+      viewport?.tile(picked);
+      return;
+    }
+    if (tool === "transit") {
+      await run({ kind: "stop", at: point }, "Transit stop built");
+      return;
+    }
+    if (tool === "layers" && roadId === undefined) return;
+    if (tool === "inspect" || tool === "layers") {
       if (roadId === undefined) {
         setSelection(undefined);
         return;
@@ -180,6 +209,20 @@ function App() {
   }, []);
 
   function choose(next: typeof tool) {
+    if (next === "land") {
+      viewport?.overview(true);
+      viewport?.tile(tile);
+      setOverview(true);
+    } else {
+      viewport?.tile();
+    }
+    if (next === "transit") {
+      setLayer("transit");
+      viewport?.layer("transit");
+    } else if (next !== "layers") {
+      setLayer("none");
+      viewport?.layer("none");
+    }
     setTool(next);
     setEconomyOpen(false);
     setSelection(undefined);
@@ -288,6 +331,9 @@ function App() {
                     zone: "Zone frontage",
                     facility: "Public works",
                     demolish: "Demolish",
+                    land: "Land and districts",
+                    transit: "Transit network",
+                    layers: "Map layers",
                   }[tool]}
         </h1>
         {economyOpen && stats ? (
@@ -300,7 +346,7 @@ function App() {
               <dt>Household workers</dt>
               <dd>{stats.workers}</dd>
               <dt>Household savings</dt>
-              <dd>${"{stats.savings.toLocaleString()}"}</dd>
+              <dd>${stats.savings.toLocaleString()}</dd>
               <dt>Undeveloped lots</dt>
               <dd>{stats.vacancies}</dd>
               <dt>Goods sold</dt>
@@ -312,9 +358,9 @@ function App() {
               <dt>Canceled trips</dt>
               <dd>{stats.lost}</dd>
               <dt>Booked income</dt>
-              <dd>${"{stats.receipts.toLocaleString()}"}</dd>
+              <dd>${stats.receipts.toLocaleString()}</dd>
               <dt>Booked spending</dt>
-              <dd>${"{stats.expenses.toLocaleString()}"}</dd>
+              <dd>${stats.expenses.toLocaleString()}</dd>
             </dl>
             <label>
               Tax rate{" "}
@@ -349,12 +395,25 @@ function App() {
               <ul>
                 {stats.ledger.map((posting, i) => (
                   <li key={i}>
-                    Day {posting.tick} · {posting.purpose} · ${"{posting.amount}"}
+                    Day {posting.tick} · {posting.purpose} · ${posting.amount}
                   </li>
                 ))}
               </ul>
             </details>
           </>
+        ) : tool === "land" && city.region ? (
+          <LandPanel owned={city.owned} tile={tile} data={city.region} run={run} />
+        ) : tool === "transit" && city.region ? (
+          <TransitPanel data={city.region} run={run} />
+        ) : tool === "layers" && city.region ? (
+          <LayersPanel
+            data={city.region}
+            layer={layer}
+            setLayer={(value) => {
+              setLayer(value);
+              viewport?.layer(value);
+            }}
+          />
         ) : roadSelection && tool === "inspect" ? (
           <>
             <dl>
@@ -414,7 +473,13 @@ function App() {
         ) : selection && !("points" in selection) && tool === "inspect" ? (
           <dl>
             <dt>Use</dt>
-            <dd>{"zone" in selection ? selection.zone : selection.service}</dd>
+            <dd>
+              {"zone" in selection
+                ? selection.zone
+                : "service" in selection
+                  ? selection.service
+                  : "Transit stop"}
+            </dd>
             <dt>Road</dt>
             <dd>{selection.roadId}</dd>
             {detail?.home && (
@@ -424,7 +489,7 @@ function App() {
                 <dt>Workers</dt>
                 <dd>{detail.home.workers}</dd>
                 <dt>Savings</dt>
-                <dd>${"{detail.home.money}"}</dd>
+                <dd>${detail.home.money}</dd>
               </>
             )}
             {detail?.firm && (
@@ -436,7 +501,7 @@ function App() {
                 <dt>Inventory</dt>
                 <dd>{detail.firm.inventory}</dd>
                 <dt>Cash</dt>
-                <dd>${"{detail.firm.money}"}</dd>
+                <dd>${detail.firm.money}</dd>
               </>
             )}
             {"built" in selection && (
@@ -589,6 +654,15 @@ function App() {
           </button>
           <button aria-pressed={tool === "demolish"} onClick={() => choose("demolish")}>
             Demolish
+          </button>
+          <button aria-pressed={tool === "land"} onClick={() => choose("land")}>
+            Land
+          </button>
+          <button aria-pressed={tool === "transit"} onClick={() => choose("transit")}>
+            Transit
+          </button>
+          <button aria-pressed={tool === "layers"} onClick={() => choose("layers")}>
+            Layers
           </button>
           <button
             aria-pressed={overview}

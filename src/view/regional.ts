@@ -8,6 +8,9 @@ import {
   DirectionalLight,
   DoubleSide,
   GridHelper,
+  Line as ThreeLine,
+  LineBasicMaterial,
+  Vector3,
   Group,
   InstancedMesh,
   Mesh,
@@ -22,12 +25,16 @@ import {
   WebGLRenderer,
 } from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
-import { CHUNK, hash, height, REGION, type Point } from "../core/world/terrain.ts";
-import { closestPoint, roadElevation, streets, type Road } from "../core/network/roads.ts";
+import { CHUNK, hash, height, REGION, TILE, type Point } from "../core/world/terrain.ts";
+import { closestPoint, segmentElevation, streets, type Road } from "../core/network/roads.ts";
+import { planner } from "../core/network/routes.ts";
+import { fields, type Field, type Stop } from "../core/sim/region.ts";
 import { zones, type Parcel, type Facility } from "../core/sim/development.ts";
 import type { Scene } from "../worker/protocol.ts";
 
 const terrainMaterial = new MeshLambertMaterial({ vertexColors: true });
+export type Layer = "none" | "utilities" | "transit" | Field;
+
 const roadMaterial = new MeshLambertMaterial({ color: 0x4b5052, side: DoubleSide });
 const shoulderMaterial = new MeshLambertMaterial({ color: 0xb1a799, side: DoubleSide });
 
@@ -56,7 +63,9 @@ export function createViewport(
   const terrain = new Group();
   const roadGroup = new Group();
   const lotGroup = new Group();
-  scene.add(terrain, roadGroup, lotGroup);
+  const overlay = new Group();
+  const transit = new Group();
+  scene.add(terrain, roadGroup, lotGroup, overlay, transit);
   const box = new BoxGeometry(1, 1, 1);
   const roof = new ConeGeometry(0.75, 1, 4);
   roof.rotateY(Math.PI / 4);
@@ -76,6 +85,19 @@ export function createViewport(
   grid.position.y = 36;
   grid.visible = false;
   scene.add(grid);
+  const tile = new Mesh(
+    new PlaneGeometry(TILE, TILE),
+    new MeshBasicMaterial({
+      color: 0xf2c888,
+      depthWrite: false,
+      transparent: true,
+      opacity: 0.24,
+      side: DoubleSide,
+    }),
+  );
+  tile.rotation.x = -Math.PI / 2;
+  tile.visible = false;
+  scene.add(tile);
 
   const preview = new Mesh(
     new BufferGeometry(),
@@ -90,6 +112,8 @@ export function createViewport(
   const dummy = new Object3D();
   const samples: number[] = [];
   let roads: Road[] = [];
+  let activeLayer: Layer = "none";
+  let latest: Scene | undefined;
   let seed: number | undefined;
   let frame = 0;
   let uploads = 0;
@@ -151,6 +175,7 @@ export function createViewport(
   }
 
   function update(model: Scene): void {
+    latest = model;
     if (seed !== model.seed) {
       for (const chunk of chunks) {
         chunk.near.geometry.dispose();
@@ -201,7 +226,7 @@ export function createViewport(
     }
 
     const active = new Set<number>();
-    for (const lot of [...model.parcels, ...model.facilities]) {
+    for (const lot of [...model.parcels, ...model.facilities, ...model.stops]) {
       active.add(lot.id);
       const key = JSON.stringify(lot);
       if (lots.get(lot.id)?.key === key) continue;
@@ -215,12 +240,91 @@ export function createViewport(
       item.group.removeFromParent();
       lots.delete(id);
     }
+    drawLayer();
   }
 
-  function makeLot(lot: Parcel | Facility): Group {
+  function drawLayer(): void {
+    for (const object of overlay.children) {
+      if (object instanceof InstancedMesh) object.dispose();
+    }
+    for (const object of transit.children) {
+      if (object instanceof ThreeLine) {
+        object.geometry.dispose();
+        (object.material as LineBasicMaterial).dispose();
+      }
+    }
+    overlay.clear();
+    transit.clear();
+    if (!latest || activeLayer === "none") return;
+    const model = latest;
+    if (activeLayer === "transit") {
+      const router = planner({ roads: model.roads, nodes: [], nextId: 0 });
+      for (const line of model.lines) {
+        const stops = line.stops.map((id) => model.stops.find((stop) => stop.id === id)!);
+        const edges = new Set<number>();
+        for (let i = 1; i < stops.length; i++) {
+          for (const id of router.route(stops[i - 1].roadId, stops[i].roadId) ?? []) edges.add(id);
+        }
+        for (const id of edges) {
+          const road = router.roads.get(id)!;
+          const points = road.points.map(
+            (point, i) =>
+              new Vector3(
+                point.x,
+                segmentElevation(model.seed, road.points, Math.max(1, i), i ? 1 : 0, road.bridge) +
+                  5,
+                point.z,
+              ),
+          );
+          transit.add(
+            new ThreeLine(
+              new BufferGeometry().setFromPoints(points),
+              new LineBasicMaterial({
+                color: line.kind === "bus" ? 0xfbce71 : 0x99edf1,
+                depthTest: false,
+              }),
+            ),
+          );
+        }
+      }
+      return;
+    }
+    const supplied = new Set(model.supplied);
+    const markers = new InstancedMesh(box, material(0xffffff), model.parcels.length);
+    for (let index = 0; index < model.parcels.length; index++) {
+      const lot = model.parcels[index];
+      const value =
+        activeLayer === "utilities"
+          ? Number(supplied.has(lot.id))
+          : fields(model, lot)[activeLayer] / 100;
+      const color =
+        activeLayer === "utilities"
+          ? new Color(value ? 0x54d7ba : 0xe46663)
+          : new Color(0x6268e9).lerp(new Color(0xf5aa48), value);
+      dummy.position.set(lot.x, height(model.seed, lot) + 1, lot.z);
+      dummy.scale.set(33, 0.9, 33);
+      dummy.updateMatrix();
+      markers.setMatrixAt(index, dummy.matrix);
+      markers.setColorAt(index, color);
+    }
+    overlay.add(markers);
+  }
+
+  function makeLot(lot: Parcel | Facility | Stop): Group {
     const group = new Group();
     group.userData.id = lot.id;
     group.position.set(lot.x, height(seed!, lot), lot.z);
+    if (!("zone" in lot) && !("service" in lot)) {
+      const pole = new Mesh(box, material(0xf1b967));
+      pole.scale.set(4, 12, 4);
+      pole.position.y = 6;
+      group.add(pole);
+      const sign = new Mesh(box, material(0x358783));
+      sign.scale.set(12, 5, 8);
+      sign.position.y = 12;
+      group.add(sign);
+      return group;
+    }
     const dimensions = "zone" in lot ? zones[lot.zone] : { size: 10, color: 0x639f9d };
     group.rotation.y = "angle" in lot ? lot.angle : 0;
     const base = new Mesh(box, material(0xabb88b));
@@ -274,7 +378,11 @@ export function createViewport(
       const edge = (i: number, sign: number) => {
         const x = a.x + ((b.x - a.x) * i) / steps;
         const z = a.z + ((b.z - a.z) * i) / steps;
-        return [x + sign * nx, roadElevation(seed!, { x, z }, bridge) + offset, z + sign * nz];
+        return [
+          x + sign * nx,
+          segmentElevation(seed!, points, k, i / steps, bridge) + offset,
+          z + sign * nz,
+        ];
       };
       for (let i = 0; i < steps; i++) {
         const left = edge(i, 1);
@@ -379,6 +487,17 @@ export function createViewport(
 
   return {
     update,
+    layer(value: Layer) {
+      activeLayer = value;
+      drawLayer();
+    },
+    tile(value?: string) {
+      tile.visible = value !== undefined;
+      if (value) {
+        const [x, z] = value.split(",").map(Number);
+        tile.position.set((x + 0.5) * TILE - REGION / 2, 37, (z + 0.5) * TILE - REGION / 2);
+      }
+    },
     preview(points: Point[], bridge: boolean) {
       preview.geometry.dispose();
       preview.geometry = ribbon(points, 12, bridge, 1.2);
