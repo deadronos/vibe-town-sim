@@ -1,6 +1,6 @@
 # Regional preview
 
-The regional game is available at `/regional.html` and from the classic game’s city overview. Build outputs contain both pages. The published entry point can stay on the classic game while the remaining regional release checks run.
+The regional game is available at `/regional.html` and from the classic game’s city overview. Build outputs contain both pages. The classic game remains the default entry while the remaining regional release checks run.
 
 The implementation plan describes the intended architecture and scale. This report records what the preview can do and what was exercised.
 
@@ -42,10 +42,22 @@ The Chrome checks use the locally installed Google Chrome. The benchmark uses ma
 
 ## Browser and scale measurements
 
-- Chrome 144.0.7559.133 using ANGLE Metal on Apple M4, Playwright Firefox 159.0 and Playwright WebKit 27.2 passed the construction, camera angles, rejected import, interrupted write, reload, land purchase and utility-layer walkthrough. Firefox reported `Apple M1, or similar` and Playwright WebKit reported `Apple GPU`.
+- Chrome 144.0.7559.133 using ANGLE Metal on Apple M4, Playwright Firefox 159.0 and Playwright WebKit 27.2 passed the construction, camera angles, rejected import, interrupted write, reload, land purchase and utility-layer walkthrough. It also compared the classic save bytes after the regional operations. Firefox reported `Apple M1, or similar` and Playwright WebKit reported `Apple GPU`.
 - Installed Safari was checked manually in a private window. It rendered the populated starter and map layers and saved and loaded its checkpoint. Safari WebDriver could not create a session while Allow Remote Automation was off. The expanded automated walkthrough for WebKit used Playwright’s browser build.
 - The synthetic renderer workload has 10,000 building slots and 2,000 moving vehicle instances across the full map. It measures rendering with fabricated geometry and vehicle paths. Browser memory values are reported JS heap, and frame intervals are animation callbacks.
-- The separate density fixture uses 1,204 developed, utility-supplied lots and 17,888 modeled residents. It uses a benchmark construction grant and advances 16 simulated days per batch. It verifies checkpoint and balance invariants under load. It is deliberately congested and runs a deficit, so use the two opening fixtures for balance comparisons.
+- The separate density fixture uses 1,204 developed, utility-supplied lots and 17,888 modeled residents. It uses a benchmark construction grant and advances 16 simulated days per batch. It verifies checkpoint and balance invariants under load. It is deliberately congested and runs a deficit. The two opening fixtures cover balance separately.
+
+Production build, Chrome 144, Apple M4, 1,920 × 1,080 pixels, device pixel ratio 1. Each render row used a four-second sample after warmup. Paused sampling kept the low-angle camera and all geometry stationary.
+
+| Backend                | Overview p95 | Low-angle p95 | Paused p95 | New-page first render |  JS heap | Geometry writes overview / low / paused | Road acknowledgement / following paint p95 |
+| ---------------------- | -----------: | ------------: | ---------: | --------------------: | -------: | --------------------------------------: | -----------------------------------------: |
+| WebGL2 / ANGLE Metal   |      16.7 ms |       16.8 ms |    16.8 ms |                186 ms | 22–23 MB |               30.88 MB / 30.90 MB / 0 B |                           0.9 ms / 34.4 ms |
+| WebGPU / Apple adapter |      16.7 ms |       16.7 ms |    16.8 ms |                233 ms | 28–30 MB |               30.72 MB / 30.72 MB / 0 B |                           0.6 ms / 33.6 ms |
+
+Geometry writes are instrumented vertex/index buffer update bytes at the browser API. First render includes local navigation and startup. The road timing starts at worker submission, checks the expected revision has rendered and samples the following animation frame. It excludes pointer handling and display scanout. WebGL2 is the default based on similar frame intervals and lower measured cold-start time and JS heap on this machine.
+
+- Headless 19,200 simulated days completed in 4.59 s, with 4.69 ms p95 and 21.23 ms maximum for 16-day batches in the measured run.
+- The dense browser soak advanced all 19,200 scheduled days in 300,003 ms at 16× in production Chrome. It exercised the actual worker clock and rendered a subset of the fixture’s live trips. The five-minute run preceded the final demand and overlay changes, and the final build passed the renderer and functional browser checks.
 
 ## Preview limits
 
