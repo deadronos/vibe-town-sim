@@ -1,3 +1,4 @@
+import { matchCommutes } from "./commutes.ts";
 export const N = 38;
 export const prices = {
   road: 20,
@@ -67,66 +68,111 @@ export function createCity(starter = true): City {
   city.tiles[id(24, 12)] = { kind: "water", level: 1 };
   return city;
 }
+// Two self-sufficient streets separated by one missing road tile at (18,18).
+export function createCommuteDistrict(): City {
+  const c = createCity(false);
+  for (let x = 12; x <= 24; x++) if (x !== 18) c.tiles[id(x, 18)].kind = "road";
+  for (const x of [13, 23]) {
+    c.tiles[id(x, 17)] = { kind: "power", level: 1 };
+    c.tiles[id(x + 1, 17)] = { kind: "water", level: 1 };
+    c.tiles[id(x, 19)] = { kind: x < 18 ? "residential" : "industrial", level: 3 };
+  }
+  return c;
+}
 export const zoned = (k: Kind) => k === "residential" || k === "commercial" || k === "industrial";
-export function stats(c: City) {
-  const group = new Int32Array(N * N).fill(-1),
-    networks: { power: number; water: number; load: number }[] = [];
-  let roads = 0;
-  for (let i = 0; i < group.length; i++) {
-    if (c.tiles[i].kind !== "road" || group[i] >= 0) continue;
-    const g = networks.length;
-    networks.push({ power: 0, water: 0, load: 0 });
+function roadServices(c: City) {
+  const entrances = c.tiles.map((t, i) =>
+    t.kind === "empty" ? [] : neighbors(i).filter((n) => c.tiles[n].kind === "road"),
+  );
+  const group = new Int32Array(c.tiles.length).fill(-1);
+  const loads: number[] = [];
+  let roads = 0,
+    parks = 0,
+    utilities = 0;
+  c.tiles.forEach((tile, i) => {
+    if (tile.kind !== "road" || group[i] >= 0) return;
+    const component = loads.length;
+    loads.push(0);
+    group[i] = component;
     const queue = [i];
-    group[i] = g;
-    for (let p = 0; p < queue.length; p++) {
+    for (let j = 0; j < queue.length; j++) {
       roads++;
-      for (const n of neighbors(queue[p]))
-        if (group[n] < 0 && c.tiles[n].kind === "road") {
-          group[n] = g;
+      for (const n of entrances[queue[j]])
+        if (group[n] < 0) {
+          group[n] = component;
           queue.push(n);
         }
     }
-  }
-  const access = c.tiles.map((t, i) =>
-    t.kind === "empty"
-      ? -1
-      : (neighbors(i)
-          .map((n) => group[n])
-          .find((g) => g >= 0) ?? -1),
-  );
-  let parks = 0,
-    utilities = 0;
-  c.tiles.forEach((t, i) => {
-    const net = networks[access[i]];
-    if (t.kind === "park") parks++;
-    if (t.kind === "water" || t.kind === "power") {
-      utilities++;
-      if (net) net[t.kind] += 200;
-    }
-    if (net && zoned(t.kind)) net.load += Math.max(1, t.level);
   });
-  const service = access.map((g) =>
-    g >= 0
-      ? Math.min(
-          1,
-          networks[g].water / Math.max(1, networks[g].load),
-          networks[g].power / Math.max(1, networks[g].load),
-        )
-      : 0,
-  );
+  const touching = entrances.map((e) => [...new Set(e.map((n) => group[n]))].sort((a, b) => a - b));
+  const access = touching.map((groups) => groups[0] ?? -1);
+  const capacity = 200;
+  const suppliers = loads.map(() => ({ power: [] as number[], water: [] as number[] }));
+  c.tiles.forEach(({ kind }, i) => {
+    if (kind === "park") parks++;
+    if (kind === "power" || kind === "water") {
+      utilities++;
+      for (const g of touching[i]) suppliers[g][kind].push(i);
+    }
+  });
+  // Each shared plant distributes its capacity proportionately to the loads
+  // of the networks it touches. Score the effect of assigning a new lot
+  // against that same capacity calculation.
+  function serviceRatio(g: number, extra: number) {
+    const ratio = (plants: number[]) =>
+      plants.reduce((sum, plant) => {
+        const demand = touching[plant].reduce(
+          (total, component) => total + loads[component],
+          extra,
+        );
+        return sum + capacity / Math.max(1, demand);
+      }, 0);
+    return Math.min(ratio(suppliers[g].power), ratio(suppliers[g].water));
+  }
+  // Reserve unambiguous loads first. A corner lot then chooses the best
+  // supplied adjacent network and contributes its load exactly once.
+  const lots = c.tiles
+    .map((_, i) => i)
+    .filter((i) => zoned(c.tiles[i].kind) && touching[i].length)
+    .sort((a, b) => touching[a].length - touching[b].length || a - b);
+  for (const i of lots) {
+    const load = Math.max(1, c.tiles[i].level);
+    let best = -1;
+    for (const g of touching[i]) {
+      const ratio = serviceRatio(g, load);
+      if (ratio > best) {
+        access[i] = g;
+        best = ratio;
+      }
+    }
+    loads[access[i]] += load;
+  }
+  const ratios = loads.map((_, g) => Math.min(1, serviceRatio(g, 0)));
+  const service = access.map((g) => ratios[g] ?? 0);
+  return { roads, parks, utilities, entrances, access, service };
+}
+export function stats(c: City) {
+  const { roads, parks, utilities, entrances, access, service } = roadServices(c);
   let population = 0,
     jobs = 0,
     shops = 0;
+  const workers = c.tiles.map(() => 0),
+    positions = c.tiles.map(() => 0);
   c.tiles.forEach((t, i) => {
     const size = Math.round(t.level * service[i] * 8);
-    if (t.kind === "residential") population += size;
+    if (t.kind === "residential") {
+      population += size;
+      workers[i] = Math.round(size * 0.58);
+    }
     if (t.kind === "commercial") {
-      jobs += size;
+      positions[i] = size;
       shops += size;
     }
-    if (t.kind === "industrial") jobs += size * 2;
+    if (t.kind === "industrial") positions[i] = size * 2;
+    jobs += positions[i];
   });
-  const employed = Math.min(population * 0.58, jobs);
+  const commute = matchCommutes(entrances, workers, positions);
+  const employed = commute.employed;
   const happiness = Math.max(
     12,
     Math.min(
@@ -140,6 +186,7 @@ export function stats(c: City) {
     ),
   );
   const income = Math.round(((population * 0.52 + employed * 0.55) * c.tax) / 9);
+  const employmentTax = income - Math.round((population * 0.52 * c.tax) / 9);
   const upkeep = roads + parks * 2 + utilities * 22;
   const demand = {
     residential: Math.min(
@@ -154,8 +201,12 @@ export function stats(c: City) {
     access,
     population,
     jobs,
+    workers,
+    positions,
+    commute,
     happiness,
     income,
+    employmentTax,
     upkeep,
     net: income - upkeep,
     demand,

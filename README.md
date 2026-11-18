@@ -26,6 +26,10 @@ The game uses native ES modules, DOM controls and a small WebGL2 renderer. All g
 3. Inspect tiles to check utility access. Add parks to improve happiness. Open Treasury to compare monthly income and upkeep or change the tax rate.
 4. Pause while planning, or advance time at 1×, 2× or 4×. Building and monthly changes autosave in this browser for this site address.
 
+Choose **Town menu → Try the commute district** to play two streets with independent utilities. Inspect the homes, build a road across the one-tile gap, then check the homes and Treasury again. Cars follow the roads linking assigned workers to their jobs. Removing that link interrupts the commutes and their tax contribution.
+
+If the game cannot read a save, it protects the original and lets you play temporarily. Open **Town menu → Recover original save** to download it or explicitly replace it with the current town.
+
 ## Controls
 
 | Action                                 | Control                                        |

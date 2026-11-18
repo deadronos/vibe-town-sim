@@ -7,13 +7,14 @@ import {
   noise,
   place,
   prices,
-  restore,
+  createCommuteDistrict,
   stats,
   tick,
   zoned,
   type Build,
   type City,
 } from "./sim.js";
+import { openSave } from "./saves.ts";
 import { world, model } from "./world.js";
 import { icon } from "./icons.js";
 const el = <T extends HTMLElement = HTMLElement>(s: string) => document.querySelector<T>(s)!;
@@ -21,16 +22,9 @@ document
   .querySelectorAll<HTMLElement>("[data-icon]")
   .forEach((e) => (e.innerHTML = icon(e.dataset.icon!)));
 const map = el<HTMLCanvasElement>("#map"),
-  dialog = el<HTMLDialogElement>("dialog"),
-  key = "vibe-town-juniper-v1";
-function load() {
-  try {
-    return restore(localStorage.getItem(key));
-  } catch {
-    return undefined;
-  }
-}
-let city = load() ?? createCity(),
+  dialog = el<HTMLDialogElement>("dialog");
+const saves = openSave(() => localStorage);
+let city = saves.city ?? createCity(),
   metrics = stats(city),
   speed = 1,
   paused = false,
@@ -59,12 +53,7 @@ const money = (v: number) =>
 const builds = Object.keys(prices) as Build[];
 const undo: { city: City; month: number }[] = [];
 function save() {
-  try {
-    localStorage.setItem(key, JSON.stringify(city));
-    el("#savestatus").textContent = "Local autosave";
-  } catch {
-    el("#savestatus").textContent = "Autosave unavailable";
-  }
+  el("#savestatus").textContent = saves.write(city);
 }
 let toastTimer = 0;
 function toast(s: string) {
@@ -137,15 +126,14 @@ function resetCamera() {
 resetCamera();
 let scene: ReturnType<Renderer["upload"]>,
   dynamic = renderer.upload(new Mesh());
-let segments: number[] = [];
+// Retain the original depth/ownership mesh throughout a demolition stroke so
+// buildings exposed by the stroke cannot be erased through the first target.
+let demolitionScene: typeof scene | null = null;
 function refresh() {
   metrics = stats(city);
-  scene = renderer.upload(world(city, overlay), scene?.buffer);
+  const reuse = scene && scene !== demolitionScene ? scene.buffer : undefined;
+  scene = renderer.upload(world(city, overlay), reuse);
   renderer.bakeShadows(scene);
-  segments = [];
-  city.tiles.forEach((t, i) => {
-    if (t.kind === "road" && noise(i, 1) > 0.55) segments.push(i);
-  });
   hud();
   save();
 }
@@ -203,14 +191,35 @@ function updateInspection() {
         : t.kind === "park"
           ? "Improves town happiness"
           : "Connects adjacent lots and utilities";
+  let commute = "";
+  if (metrics.workers[inspected]) {
+    const workers = metrics.workers[inspected],
+      matched = metrics.commute.matched[inspected];
+    commute =
+      matched === workers
+        ? `${matched} workers commute to jobs.`
+        : `${matched} of ${workers} employed. ${metrics.commute.hasReachableJobs[inspected] ? "Reachable jobs are full." : "No road to an active workplace."}`;
+  } else if (metrics.positions[inspected]) {
+    const jobs = metrics.positions[inspected],
+      vacant = metrics.commute.vacancies[inspected];
+    commute =
+      `${jobs - vacant} of ${jobs} jobs filled.` +
+      (vacant ? " Connect housing with available workers." : "");
+  }
   p.innerHTML =
-    "<b>" + names[t.kind] + (zoned(t.kind) ? " · Level " + t.level + "/3" : "") + "</b>" + status;
+    "<b>" +
+    names[t.kind] +
+    (zoned(t.kind) ? " · Level " + t.level + "/3" : "") +
+    "</b>" +
+    status +
+    (commute ? "<br>" + commute : "");
 }
 function select(k: Build | null) {
   orbitMode = false;
   el("#orbit").classList.remove("active");
   el("#orbit").setAttribute("aria-pressed", "false");
   tool = k;
+  hover = null;
   inspected = -1;
   updateInspection();
   el("#toolhint").textContent = k
@@ -235,20 +244,29 @@ function frame(time: number) {
     [0.79, 0.88, 0.9],
     Math.min(window.devicePixelRatio || 1, 2),
   );
+  renderer.gl.uniform1i(
+    renderer.demolitionLot,
+    tool === "bulldoze" && hover ? id(hover.x, hover.z) + 1 : 0,
+  );
   renderer.draw(scene);
   const m = new Mesh();
-  for (const i of segments) {
-    const x = i % N,
-      z = Math.floor(i / N),
-      along = city.tiles[i + 1]?.kind === "road",
-      other = city.tiles[i + N]?.kind === "road";
-    if (!along && !other) continue;
-    const seed = noise(i, 22),
-      phase = (trafficTime * 0.00032 + seed * 5) % 2,
-      dist = phase < 1 ? phase : 2 - phase,
-      lane = phase < 1 ? 0.37 : 0.62;
-    const a = x + (along ? 0.42 + dist : lane),
-      b = z + (along ? lane : 0.42 + dist);
+  for (const { home, workplace, path } of metrics.commute.routes) {
+    const length = path.length - 1;
+    if (!length) continue;
+    const seed = noise(home, workplace),
+      phase = (trafficTime * 0.0011 + seed * length * 2) % (length * 2);
+    const returning = phase >= length,
+      progress = returning ? length * 2 - phase : phase;
+    const j = Math.min(length - 1, Math.floor(progress)),
+      from = path[j],
+      to = path[j + 1],
+      fraction = progress - j;
+    const dx = (to % N) - (from % N),
+      dz = Math.floor(to / N) - Math.floor(from / N);
+    const along = dx !== 0,
+      lane = returning ? -0.1 : 0.1;
+    const a = (from % N) + 0.45 + dx * fraction + dz * lane,
+      b = Math.floor(from / N) + 0.45 + dz * fraction - dx * lane;
     m.box(
       a,
       0.034,
@@ -338,6 +356,11 @@ function rollback() {
   refresh();
   toast("Construction undone.");
 }
+function targetAt(x: number, y: number) {
+  if (tool !== "bulldoze") return renderer.pick(x, y);
+  const lot = renderer.visibleLot(x, y, demolitionScene ?? scene);
+  return lot < 0 ? null : { x: lot % N, z: Math.floor(lot / N) };
+}
 function change(x: number, z: number) {
   if (!tool) return;
   const err = place(city, x, z, tool);
@@ -368,6 +391,7 @@ map.onpointerdown = (e) => {
   map.setPointerCapture(e.pointerId);
   const orbit = e.button === 2 || (orbitMode && !e.shiftKey && e.button === 0);
   const pan = orbit || e.button !== 0 || e.shiftKey || !tool;
+  if (!pan && tool === "bulldoze") demolitionScene = scene;
   pointer = {
     id: e.pointerId,
     startX: e.clientX,
@@ -379,12 +403,12 @@ map.onpointerdown = (e) => {
     drag: false,
     built: false,
     before: pan ? undefined : structuredClone(city),
-    cell: renderer.pick(e.clientX, e.clientY),
+    cell: targetAt(e.clientX, e.clientY),
   };
   if (!pan && pointer.cell && change(pointer.cell.x, pointer.cell.z)) refresh();
 };
 map.onpointermove = (e) => {
-  hover = renderer.pick(e.clientX, e.clientY);
+  hover = targetAt(e.clientX, e.clientY);
   if (!pointer || pointer.id !== e.pointerId) return;
   const p = pointer;
   p.drag ||= Math.hypot(e.clientX - p.startX, e.clientY - p.startY) > 4;
@@ -399,6 +423,10 @@ map.onpointermove = (e) => {
       renderer.x = Math.max(-6, Math.min(N + 6, renderer.x + old.x - now.x));
       renderer.z = Math.max(-6, Math.min(N + 6, renderer.z + old.z - now.z));
     }
+  } else if (!p.pan && tool === "bulldoze") {
+    if (hover && (hover.x !== p.cell?.x || hover.z !== p.cell?.z) && change(hover.x, hover.z))
+      refresh();
+    p.cell = hover;
   } else if (!p.pan && (!hover || !p.cell)) {
     p.cell = hover;
     if (hover && change(hover.x, hover.z)) refresh();
@@ -434,6 +462,9 @@ function finish(e: PointerEvent) {
     inspected = renderer.visibleLot(e.clientX, e.clientY, scene);
     updateInspection();
   }
+  if (demolitionScene && demolitionScene !== scene)
+    renderer.gl.deleteBuffer(demolitionScene.buffer);
+  demolitionScene = null;
   pointer = null;
 }
 map.onpointerup = finish;
@@ -464,6 +495,12 @@ function budget() {
       money(metrics.upkeep) +
       '</b></div><div class="row">Monthly balance<b>' +
       money(metrics.net) +
+      '</b></div><div class="row">Workers with reachable jobs<b>' +
+      metrics.commute.employed +
+      " / " +
+      metrics.workers.reduce((a, b) => a + b, 0) +
+      '</b></div><div class="row">Employment tax included<b id="jobtax">' +
+      money(metrics.employmentTax) +
       '</b></div><label class="row" for="tax">Tax rate<b id="rate">' +
       city.tax +
       '%</b></label><input type="range" id="tax" min="3" max="18" value="' +
@@ -477,6 +514,7 @@ function budget() {
     const vals = el("#dialogbody").querySelectorAll("div b");
     vals[1].textContent = money(metrics.income);
     vals[3].textContent = money(metrics.net);
+    el("#jobtax").textContent = money(metrics.employmentTax);
     undo.length = 0;
     hud();
     save();
@@ -490,29 +528,64 @@ function guide() {
   );
 }
 el("#demand-help").onclick = guide;
+function recovery() {
+  modal(
+    "Original save protected",
+    '<p>This browser has a town that this version cannot open. You can play a temporary town while the original stays in storage.</p><button class="action" id="export">Download original save</button><button class="action" id="replacesave">Replace original with current town…</button>',
+  );
+  el("#export").onclick = () => {
+    const url = URL.createObjectURL(
+      new Blob([saves.original ?? ""], { type: "application/octet-stream" }),
+    );
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "juniper-bay-original.json";
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  };
+  el("#replacesave").onclick = () => {
+    modal(
+      "Replace original save?",
+      '<p>This permanently replaces the protected original with your current town.</p><button class="action" id="confirm-save">Replace original save</button>',
+    );
+    el("#confirm-save").onclick = () => {
+      el("#savestatus").textContent = saves.write(city, true);
+      dialog.close();
+    };
+  };
+}
 el("#menu").onclick = () => {
   modal(
     "Town menu",
-    '<button class="action" id="guide">Town guide</button><button class="action" id="undo">Undo construction this month</button><button class="action" id="fresh">Start an empty island</button><button class="action" id="starter">Restore starter town</button>',
+    '<button class="action" id="guide">Town guide</button><button class="action" id="undo">Undo construction this month</button><button class="action" id="fresh">Start an empty island</button><button class="action" id="district">Try the commute district</button><button class="action" id="starter">Restore starter town</button>' +
+      (saves.protectedSave
+        ? '<button class="action" id="recover">Recover original save</button>'
+        : ""),
   );
+  if (saves.protectedSave) el("#recover").onclick = recovery;
   el("#guide").onclick = guide;
   el("#undo").onclick = () => {
     dialog.close();
     rollback();
   };
-  for (const [s, starter] of [
-    ["#fresh", false],
-    ["#starter", true],
+  for (const [s, makeTown, description] of [
+    ["#fresh", () => createCity(false), "an empty island and $18,000."],
+    [
+      "#district",
+      createCommuteDistrict,
+      "two serviced streets. Build a road across the one-tile gap to connect homes to jobs.",
+    ],
+    ["#starter", () => createCity(true), "the starter town."],
   ] as const)
     el(s).onclick = () => {
       modal(
         "Replace this town?",
-        "<p>Your current local save will be replaced with " +
-          (starter ? "the starter town." : "an empty island and $18,000.") +
+        "<p>Your current town will be replaced with " +
+          description +
           '</p><button class="action" id="replace">Replace town</button>',
       );
       el("#replace").onclick = () => {
-        city = createCity(starter);
+        city = makeTown();
         timer = 0;
         undo.length = 0;
         select(null);
@@ -549,3 +622,5 @@ map.addEventListener("webglcontextlost", (e) => {
 });
 map.addEventListener("webglcontextrestored", () => location.reload());
 requestAnimationFrame(frame);
+
+if (saves.protectedSave) recovery();
