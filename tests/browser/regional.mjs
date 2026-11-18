@@ -21,7 +21,7 @@ for (const engine of process.argv.slice(2).length ? process.argv.slice(2) : Obje
     });
     const exceptions = [];
     page.on("pageerror", (error) => exceptions.push(error.message));
-    await page.goto(`${target}/regional.html?qa&empty`);
+    await page.goto(`${target}/?qa&empty`);
     await page.waitForFunction(() => window.regionalQA?.view.measurements().firstRender > 0);
     const legacy = '{"version":1,"marker":"classic fixture spacing  remains"}';
     await page.evaluate((raw) => localStorage.setItem("vibe-town-juniper-v1", raw), legacy);
@@ -118,9 +118,9 @@ for (const engine of process.argv.slice(2).length ? process.argv.slice(2) : Obje
     await status("Checkpoint loaded");
     assert.equal((await checkpoint()).roads[0].id, road.id);
 
-    await page.goto(`${target}/regional.html`);
+    await page.goto(`${target}/`);
     await status("Regional checkpoint restored");
-    await page.goto(`${target}/regional.html?qa&seed=7`);
+    await page.goto(`${target}/?qa&seed=7`);
     await page.waitForFunction(() => window.regionalQA?.view.measurements().firstRender > 0);
     assert.ok((await checkpoint()).parcels.some((lot) => lot.built));
     await page.getByRole("button", { name: "Land", exact: true }).click();

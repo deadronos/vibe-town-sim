@@ -57,7 +57,7 @@ try {
     const errors = [];
     page.on("pageerror", (error) => errors.push(error.message));
     const started = performance.now();
-    await page.goto(`${url}/regional.html?benchmark&backend=${backend}&qa`);
+    await page.goto(`${url}/?benchmark&backend=${backend}&qa`);
     await page.waitForFunction(() => window.regionalBenchmark?.measurements().firstRender > 0);
     const cold = Math.round(performance.now() - started);
     const device = await page.evaluate(async (backend) => {

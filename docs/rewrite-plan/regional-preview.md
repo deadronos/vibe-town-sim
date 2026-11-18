@@ -1,6 +1,6 @@
 # Regional preview
 
-The regional game is available at `/regional.html` and from the classic game’s city overview. Build outputs contain both pages. The classic game remains the default entry while the remaining regional release checks run.
+Vibe Town opens the regional game at `/`. The regional preview uses its own IndexedDB saves. The original tile-based game is available in Git history at `d540699`.
 
 The implementation plan describes the intended architecture and scale. This report records what the preview can do and what was exercised.
 

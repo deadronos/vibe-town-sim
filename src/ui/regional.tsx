@@ -363,7 +363,7 @@ function App() {
     >
       <canvas ref={canvas} aria-label="Regional city map" tabIndex={0} />
       <header className="hud">
-        <a className="wordmark" href="./regional.html">
+        <a className="wordmark" href="./">
           VIBE <strong>TOWN</strong>
         </a>
         <div>
@@ -769,9 +769,6 @@ function App() {
             >
               Start selected opening
             </button>
-            <p>
-              <a href="./index.html">Juniper Bay classic</a>
-            </p>
           </details>
         )}
         <div className="file-actions">

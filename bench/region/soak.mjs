@@ -20,7 +20,7 @@ try {
   });
   const errors = [];
   page.on("pageerror", (error) => errors.push(error.message));
-  await page.goto(`${url}/regional.html?qa&empty`);
+  await page.goto(`${url}/?qa&empty`);
   await page.waitForFunction(() => window.regionalQA?.view.measurements().firstRender > 0);
   const reply = await page.evaluate(
     (checkpoint) => window.regionalQA.send({ kind: "restore", checkpoint }),

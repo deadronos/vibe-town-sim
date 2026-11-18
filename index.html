@@ -1,98 +1,14 @@
 <!doctype html>
 <html lang="en">
   <head>
-    <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width,initial-scale=1" />
-    <meta name="theme-color" content="#f8f8ee" />
-    <title>Vibe Town · City builder</title>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#172724" />
+    <title>Vibe Town · Regional City</title>
     <link rel="icon" href="data:," />
-    <link rel="stylesheet" href="./style.css" />
+    <script type="module" src="/src/ui/regional.tsx"></script>
   </head>
   <body>
-    <header>
-      <div class="brand"><span class="mark" data-icon="brand"></span>Vibe Town</div>
-      <div class="metrics">
-        <button id="budget" title="Open city budget">
-          <i data-icon="wallet"></i><span><small>Treasury</small><b id="funds"></b></span>
-        </button>
-        <div>
-          <i data-icon="people"></i><span><small>Population</small><b id="pop"></b></span>
-        </div>
-        <div>
-          <i data-icon="smile"></i><span><small>Happiness</small><b id="happy"></b></span>
-        </div>
-      </div>
-      <div class="time">
-        <span id="date"></span><button id="pause" title="Pause simulation (Space)"></button
-        ><button id="speed" title="Change simulation speed">1×</button>
-      </div>
-      <button class="square" id="menu" aria-label="Town menu" data-icon="menu"></button>
-    </header>
-    <main>
-      <canvas id="map" aria-label="Interactive 3D city map" tabindex="0"></canvas>
-      <section class="overview">
-        <div class="eyebrow"><span class="live"></span> CITY OVERVIEW</div>
-        <h1>Juniper Bay</h1>
-        <div class="sub"><span data-icon="pin"></span> Coastal region</div>
-        <a class="regional-preview" href="./regional.html">Play the regional preview</a>
-        <div class="demand-title">
-          Zone demand
-          <button id="demand-help" aria-label="Explain zone demand" data-icon="info"></button>
-        </div>
-        <div id="demand"></div>
-      </section>
-      <nav class="maptools" aria-label="Map controls">
-        <button
-          id="inspect"
-          title="Inspect or pan (I)"
-          aria-label="Inspect or pan"
-          data-icon="pointer"
-        ></button
-        ><button
-          id="layers"
-          aria-label="Toggle zone colors"
-          title="Zone colors (L)"
-          data-icon="layers"
-        ></button>
-        <button
-          id="orbit"
-          title="Orbit camera (O) · Drag to rotate and tilt"
-          aria-label="Orbit camera"
-          aria-pressed="false"
-          data-icon="orbit"
-        ></button>
-        <hr />
-        <button id="plus" aria-label="Zoom in" title="Zoom in" data-icon="plus"></button
-        ><button id="minus" aria-label="Zoom out" title="Zoom out" data-icon="minus"></button
-        ><button
-          id="rotate"
-          aria-label="Rotate map"
-          title="Rotate map (R)"
-          data-icon="rotate"
-        ></button
-        ><button id="fit" aria-label="Reset camera" title="Reset camera" data-icon="fit"></button>
-      </nav>
-      <div id="tileinfo" hidden></div>
-      <div id="toast" role="status"></div>
-      <section class="dock">
-        <div class="docktitle">
-          <strong data-icon="hammer"></strong><b>Construction</b
-          ><span id="toolhint">Select a tool to build</span>
-        </div>
-        <div id="tools"></div>
-      </section>
-      <div class="foot">
-        <span><i class="live"></i><span id="savestatus">Local autosave</span></span
-        ><span>Right-drag to orbit <em>·</em> Scroll to zoom</span>
-      </div>
-    </main>
-    <dialog id="dialog">
-      <div class="dialoghead">
-        <h2></h2>
-        <button id="close" aria-label="Close dialog" data-icon="close"></button>
-      </div>
-      <div id="dialogbody"></div>
-    </dialog>
-    <script type="module" src="./src/main.ts"></script>
+    <main id="root"></main>
   </body>
 </html>

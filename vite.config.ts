@@ -6,5 +6,4 @@ export default defineConfig({
   base: "./",
   server: local,
   preview: local,
-  build: { rollupOptions: { input: ["index.html", "regional.html"] } },
 });
