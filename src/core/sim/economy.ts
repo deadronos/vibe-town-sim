@@ -26,7 +26,14 @@ export interface Firm {
   money: number;
   inventory: number;
 }
-export type TripKind = "commute" | "shipment" | "shopping" | "dispatch";
+export type TripKind =
+  | "commute"
+  | "shipment"
+  | "shopping"
+  | "dispatch"
+  | "export"
+  | "import"
+  | "outside-job";
 export interface Trip {
   id: number;
   kind: TripKind;
@@ -39,6 +46,7 @@ export interface Trip {
   mode: "road" | "bus" | "tram";
   returning?: boolean;
   line?: number;
+  terminal?: number;
 }
 export interface Posting {
   tick: number;
@@ -57,6 +65,8 @@ export interface Economy {
   expenses: number;
   produced: number;
   consumed: number;
+  lastSales: number;
+  salesAtMonthStart: number;
   imported: number;
   exported: number;
   scrapped: number;
@@ -74,6 +84,8 @@ export interface EconomicCity extends Development {
   economy: Economy;
   tax: number;
   gateway: number;
+  debt: number;
+  refinancing: boolean;
 }
 
 export function newEconomy(): Economy {
@@ -87,6 +99,8 @@ export function newEconomy(): Economy {
     expenses: 0,
     produced: 0,
     consumed: 0,
+    lastSales: 0,
+    salesAtMonthStart: 0,
     imported: 0,
     exported: 0,
     scrapped: 0,
@@ -144,6 +158,13 @@ export function synchronizeEconomy(city: RegionalCity, router: Router): void {
       trip.kind === "dispatch" ? city.facilities.find((item) => item.id === trip.from) : undefined;
     const origin = from ?? facility;
     let path = origin && to && router.route(origin.roadId, to.roadId);
+    const gateway = city.gateway === trip.to || city.gateway === trip.from ? city.gateway : 0;
+    if ((trip.kind === "export" || trip.kind === "outside-job") && from && gateway) {
+      path = tradePath(city, router, from.roadId, gateway, trip.terminal);
+    }
+    if (trip.kind === "import" && to && gateway) {
+      path = tradePath(city, router, gateway, to.roadId, trip.terminal);
+    }
     if (trip.returning && path) path = [...path].reverse();
     if (trip.line !== undefined && path && from && to) {
       const transit = chooseLine(city, router, from, to, path);
@@ -157,6 +178,17 @@ export function synchronizeEconomy(city: RegionalCity, router: Router): void {
       continue;
     trip.edge = -1;
     economy.lost++;
+    if (trip.kind === "import") {
+      if (economy.firms[trip.to])
+        transfer(city, "cargo", `firm:${trip.to}`, trip.quantity * 3, "Canceled import");
+      continue;
+    }
+    if (trip.kind === "export") {
+      if (economy.firms[trip.from] && active.has(trip.from))
+        economy.firms[trip.from].inventory += trip.quantity;
+      else economy.scrapped += trip.quantity;
+      continue;
+    }
     if (trip.kind !== "shipment") continue;
     const buyer = economy.firms[trip.to];
     if (buyer)
@@ -228,6 +260,58 @@ function start(
   }
 }
 
+function tradePath(
+  city: RegionalCity,
+  router: Router,
+  from: number,
+  to: number,
+  terminal?: number,
+) {
+  if (terminal === undefined) return router.route(from, to);
+  const depot = city.facilities.find(
+    (facility) => facility.id === terminal && facility.service === "freight",
+  );
+  if (!depot) return;
+  const first = router.route(from, depot.roadId);
+  const last = router.route(depot.roadId, to);
+  if (first && last) return [...first, ...(first.at(-1) === last[0] ? last.slice(1) : last)];
+}
+
+function startOutside(
+  city: RegionalCity,
+  router: Router,
+  kind: "outside-job" | "export" | "import",
+  from: number,
+  to: number,
+  fromRoad: number,
+  toRoad: number,
+  quantity: number,
+): boolean {
+  const terminal =
+    kind === "outside-job"
+      ? undefined
+      : city.facilities.find(
+          (facility) =>
+            facility.service === "freight" &&
+            tradePath(city, router, fromRoad, toRoad, facility.id),
+        )?.id;
+  const edges = tradePath(city, router, fromRoad, toRoad, terminal);
+  if (!edges) return false;
+  city.economy.trips.push({
+    id: city.nextId++,
+    kind,
+    from,
+    to,
+    edges,
+    edge: 0,
+    due: 0,
+    quantity,
+    mode: "road",
+    terminal,
+  });
+  return true;
+}
+
 export function startDispatch(
   city: RegionalCity,
   from: number,
@@ -262,11 +346,29 @@ function finish(city: RegionalCity, trip: Trip): boolean {
   }
   const from = economy.households[trip.from];
   const to = economy.firms[trip.to];
+  if (trip.kind === "outside-job" && from) {
+    const wages = trip.quantity * 7;
+    transfer(city, "regional", `home:${trip.from}`, wages, "External commute wages");
+    from.income += wages;
+    economy.commutes += trip.quantity;
+    return false;
+  }
+  if (trip.kind === "export" && economy.firms[trip.from]) {
+    economy.exported += trip.quantity;
+    transfer(city, "regional", `firm:${trip.from}`, trip.quantity * 4, "Goods exports");
+    return false;
+  }
+  if (trip.kind === "import" && to) {
+    to.inventory += trip.quantity;
+    economy.imported += trip.quantity;
+    transfer(city, "cargo", "regional", trip.quantity * 3, "Goods imports");
+    return false;
+  }
   if (trip.kind === "commute" && from && to) {
-    const staff = Math.min(trip.quantity, to.jobs - to.staff, Math.floor(to.money / 2));
+    const staff = Math.min(trip.quantity, to.jobs - to.staff, Math.floor(to.money / 4));
     to.staff += staff;
     economy.commutes += staff;
-    const wage = staff * 2;
+    const wage = staff * 4;
     transfer(city, `firm:${to.id}`, `home:${from.id}`, wage, "Wages");
     from.income += wage;
     economy.payroll += wage;
@@ -351,6 +453,10 @@ export function economicDay(city: RegionalCity, router: Router, supplied: Set<nu
   const lots = new Map(city.parcels.map((lot) => [lot.id, lot]));
   const firms = Object.values(economy.firms).filter((firm) => supplied.has(firm.id));
   const homes = Object.values(economy.households).filter((home) => supplied.has(home.id));
+  for (const firm of firms) {
+    if (lots.get(firm.id)!.zone === "offices" && firm.staff > 0)
+      transfer(city, "regional", `firm:${firm.id}`, firm.staff * 4, "Office services");
+  }
   const factories = firms.filter((firm) => lots.get(firm.id)?.zone === "industry");
   const shops = firms.filter((firm) => ["shops", "mixed"].includes(lots.get(firm.id)!.zone));
   const components = city.gateway ? roadComponents(city) : undefined;
@@ -370,54 +476,75 @@ export function economicDay(city: RegionalCity, router: Router, supplied: Set<nu
     const assigned = new Map<number, number>();
     const commuting = new Set<number>();
     for (const trip of economy.trips) {
-      if (trip.kind !== "commute") continue;
+      if (trip.kind !== "commute" && trip.kind !== "outside-job") continue;
       commuting.add(trip.from);
-      assigned.set(trip.to, (assigned.get(trip.to) ?? 0) + trip.quantity);
+      if (trip.kind === "commute")
+        assigned.set(trip.to, (assigned.get(trip.to) ?? 0) + trip.quantity);
     }
     for (const firm of Object.values(economy.firms)) firm.staff = 0;
+    const byOrigin = new Map<
+      number,
+      Array<{ firm: Firm; lot: Parcel; edges: number[]; time: number }>
+    >();
     for (const home of homes) {
       if (commuting.has(home.id)) continue;
       const origin = lots.get(home.id)!;
-      const slack = Math.max(0, home.money - home.rent);
-      if (slack < home.workers) continue;
-      const candidates = firms
-        .map((firm) => {
+      let candidates = byOrigin.get(origin.roadId);
+      if (!candidates) {
+        const paths = new Map<number, { edges: number[]; time: number } | undefined>();
+        candidates = [];
+        for (const firm of firms) {
           const lot = lots.get(firm.id)!;
-          if (firm.jobs <= (assigned.get(firm.id) ?? 0)) return undefined;
-          const edges = router.route(origin.roadId, lot.roadId);
-          return edges
-            ? {
-                firm,
-                lot,
-                edges,
-                time: edges.reduce((sum, id) => sum + travelDays(router.roads.get(id)!), 0),
-              }
-            : undefined;
-        })
-        .filter((candidate) => candidate !== undefined)
-        .sort((a, b) => a.time - b.time || a.firm.id - b.firm.id);
+          if (!paths.has(lot.roadId)) {
+            const edges = router.route(origin.roadId, lot.roadId);
+            paths.set(
+              lot.roadId,
+              edges
+                ? {
+                    edges,
+                    time: edges.reduce((sum, id) => sum + travelDays(router.roads.get(id)!), 0),
+                  }
+                : undefined,
+            );
+          }
+          const path = paths.get(lot.roadId);
+          if (path) candidates.push({ firm, lot, ...path });
+        }
+        candidates.sort((a, b) => a.time - b.time || a.firm.id - b.firm.id);
+        byOrigin.set(origin.roadId, candidates);
+      }
       let available = home.workers;
       for (const candidate of candidates) {
         const quantity = Math.min(
           available,
           candidate.firm.jobs - (assigned.get(candidate.firm.id) ?? 0),
         );
+        if (quantity <= 0) continue;
         start(city, "commute", origin, candidate.lot, candidate.edges, quantity, router);
         assigned.set(candidate.firm.id, (assigned.get(candidate.firm.id) ?? 0) + quantity);
         available -= quantity;
         if (available === 0) break;
       }
       if (available && external(origin)) {
-        const income = available * 3;
-        transfer(city, "regional", `home:${home.id}`, income, "External commute wages");
-        home.income += income;
+        startOutside(
+          city,
+          router,
+          "outside-job",
+          home.id,
+          city.gateway,
+          origin.roadId,
+          city.gateway,
+          available,
+        );
       }
     }
   }
 
   if (tick % 4 === 0) {
     const incoming = new Set(
-      economy.trips.filter((trip) => trip.kind === "shipment").map((trip) => trip.to),
+      economy.trips
+        .filter((trip) => trip.kind === "shipment" || trip.kind === "import")
+        .map((trip) => trip.to),
     );
     for (const shop of shops) {
       const target = lots.get(shop.id)!;
@@ -435,10 +562,13 @@ export function economicDay(city: RegionalCity, router: Router, supplied: Set<nu
         ordered = true;
         break;
       }
-      if (!ordered && external(target) && shop.money >= 42) {
-        transfer(city, `firm:${shop.id}`, "regional", 42, "Imports");
-        shop.inventory += 14;
-        economy.imported += 14;
+      if (
+        !ordered &&
+        external(target) &&
+        shop.money >= 42 &&
+        startOutside(city, router, "import", city.gateway, shop.id, city.gateway, target.roadId, 14)
+      ) {
+        transfer(city, `firm:${shop.id}`, "cargo", 42, "Import order");
       }
     }
 
@@ -468,12 +598,31 @@ export function economicDay(city: RegionalCity, router: Router, supplied: Set<nu
   }
 
   if (tick % 30 === 0) {
+    economy.lastSales = economy.consumed - economy.salesAtMonthStart;
+    economy.salesAtMonthStart = economy.consumed;
     for (const factory of factories) {
       const origin = lots.get(factory.id)!;
-      if (factory.inventory > 46 && external(origin)) {
-        factory.inventory -= 40;
-        economy.exported += 40;
-        transfer(city, "regional", `firm:${factory.id}`, 120, "Goods exports");
+      const depot = city.facilities.some(
+        (facility) =>
+          facility.service === "freight" &&
+          tradePath(city, router, origin.roadId, city.gateway, facility.id),
+      );
+      const batch = depot ? 64 : 40;
+      if (
+        factory.inventory >= batch + 6 &&
+        external(origin) &&
+        startOutside(
+          city,
+          router,
+          "export",
+          factory.id,
+          city.gateway,
+          origin.roadId,
+          city.gateway,
+          batch,
+        )
+      ) {
+        factory.inventory -= batch;
       }
     }
     for (const home of homes) {
@@ -490,15 +639,6 @@ export function economicDay(city: RegionalCity, router: Router, supplied: Set<nu
       );
     }
     for (const firm of firms) {
-      if (lots.get(firm.id)!.zone === "offices" && firm.staff > 0) {
-        transfer(
-          city,
-          "regional",
-          `firm:${firm.id}`,
-          firm.staff * 14,
-          "Regional professional services",
-        );
-      }
       const rate = city.region.districts[landId(lots.get(firm.id)!)]?.tax ?? city.tax;
       const tax = Math.min(Math.floor((firm.jobs * rate) / 3), firm.money);
       transfer(city, `firm:${firm.id}`, "city", tax, "Business taxes");
@@ -515,6 +655,11 @@ export function economicDay(city: RegionalCity, router: Router, supplied: Set<nu
       city.roads.length * 9 + (city.land.length - 1) * LAND_UPKEEP + transitCost,
     );
     transfer(city, "city", "regional", upkeep, "Monthly infrastructure operations");
+    if (city.debt && city.cash > 2_000) {
+      const repayment = Math.min(city.debt, 540, city.cash - 2_000);
+      city.debt -= repayment;
+      transfer(city, "city", "regional", repayment, "Recovery loan repayment");
+    }
   }
 }
 
@@ -535,7 +680,32 @@ export function economicSummary(city: EconomicCity) {
   const staff = firms.reduce((total, firm) => total + firm.staff, 0);
   const workers = homes.reduce((total, home) => total + home.workers, 0);
   const savings = homes.reduce((total, home) => total + home.money, 0);
-  const vacancies = city.parcels.filter((lot) => !lot.built).length;
+  const potentialHomes = city.parcels.filter((lot) => !lot.built && zones[lot.zone].residents > 0);
+  const vacancies =
+    city.parcels.length -
+    homes.length -
+    firms.length +
+    city.parcels.filter((lot) => lot.built && lot.zone === "mixed").length;
+  const components = roadComponents(city);
+  const jobComponents = new Map<number, number>();
+  for (const lot of city.parcels) {
+    const firm = economy.firms[lot.id];
+    const component = components.get(lot.roadId);
+    if (firm && component !== undefined)
+      jobComponents.set(component, (jobComponents.get(component) ?? 0) + firm.jobs);
+  }
+  const housingComponents = new Set(
+    city.parcels
+      .filter((lot) => zones[lot.zone].residents > 0)
+      .map((lot) => components.get(lot.roadId)),
+  );
+  const reachableJobs = [...jobComponents.entries()].reduce(
+    (sum, [id, count]) => sum + (housingComponents.has(id) ? count : 0),
+    0,
+  );
+  const outsideAccess = city.gateway > 0 && housingComponents.has(components.get(city.gateway));
+  const affordability = Math.min(100, Math.round((savings / Math.max(1, residents * 35)) * 100));
+  const bound = (value: number) => Math.max(0, Math.min(100, Math.round(value)));
   return {
     residents,
     jobs,
@@ -553,12 +723,31 @@ export function economicSummary(city: EconomicCity) {
     shipments: economy.deliveries,
     lost: economy.lost,
     queued: economy.queued,
+    reachableJobs,
+    affordability,
+    housingVacancies: potentialHomes.length,
+    lastSales: economy.lastSales,
+    roadQueues: Object.entries(economy.roadTraffic)
+      .filter(([, status]) => status.queued > 0)
+      .map(([id, status]) => ({ id: Number(id), queued: status.queued, admitted: status.admitted }))
+      .sort((a, b) => b.queued - a.queued || a.id - b.id)
+      .slice(0, 24),
     demand: {
-      housing: Math.max(0, Math.min(100, 55 + (jobs - workers) * 2 - vacancies - city.tax)),
-      retail: Math.max(0, Math.min(100, residents / 3 + economy.consumed / 10 - city.tax)),
-      industry: Math.max(
-        0,
-        Math.min(100, 30 + (workers - staff) / 2 + (city.gateway ? 20 : 0) - city.tax),
+      housing: bound(
+        18 +
+          reachableJobs / 8 +
+          (outsideAccess ? 40 : 0) +
+          affordability / 4 -
+          potentialHomes.length * 1.5 -
+          city.tax * 1.3,
+      ),
+      retail: bound(8 + residents / 25 + economy.lastSales / 2 + affordability / 5 - city.tax),
+      industry: bound(
+        12 +
+          (workers - staff) / 12 +
+          economy.lastSales / 6 +
+          (city.gateway ? 20 : 0) -
+          city.tax / 2,
       ),
     },
     ledger: economy.ledger.slice(-8).reverse(),

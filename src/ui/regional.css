@@ -229,3 +229,23 @@ dd {
   gap: 0.3rem;
   margin-bottom: 0.7rem;
 }
+.inspector a {
+  color: var(--accent);
+  text-underline-offset: 0.15em;
+}
+@media (max-width: 740px) {
+  .dock {
+    width: calc(100% - 1.5rem);
+  }
+  .dock nav {
+    flex-wrap: wrap;
+    justify-content: center;
+  }
+  .dock nav button {
+    padding: 0.35rem 0.55rem;
+    font-size: 0.82rem;
+  }
+  .hud {
+    inset: 0.65rem 0.65rem auto;
+  }
+}

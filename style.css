@@ -587,3 +587,11 @@ input[type="range"] {
     height: 24px;
   }
 }
+
+.regional-preview {
+  display: inline-block;
+  margin-top: 0.5rem;
+  color: inherit;
+  font-size: 0.82rem;
+  text-underline-offset: 0.18em;
+}

@@ -1,3 +1,4 @@
+import { height, REGION, TILE } from "../core/world/terrain.ts";
 import { useState } from "react";
 import {
   adjacent,
@@ -14,23 +15,37 @@ type Run = (command: Command, message: string) => Promise<boolean>;
 type Summary = ReturnType<typeof regionSummary>;
 
 export function LandPanel({
+  seed,
   owned,
   tile,
   data,
   run,
 }: {
+  seed: number;
   owned: string[];
   tile: string;
   data: Summary;
   run: Run;
 }) {
   const policy = data.districts.find((district) => district.tile === tile);
+  const [x, z] = tile.split(",").map((value) => Number(value) * TILE - REGION / 2);
+  let dry = 0;
+  for (let row = 0; row < 12; row++) {
+    for (let column = 0; column < 12; column++) {
+      if (
+        height(seed, { x: x + ((column + 0.5) * TILE) / 12, z: z + ((row + 0.5) * TILE) / 12 }) > 1
+      )
+        dry++;
+    }
+  }
   return (
     <>
       <p>Click the map to select land. Each tile covers 4 km².</p>
       <dl>
         <dt>Tile</dt>
         <dd>{tile}</dd>
+        <dt>Approx. dry area</dt>
+        <dd>{((dry * 4) / 144).toFixed(1)} km²</dd>
         <dt>Status</dt>
         <dd>
           {owned.includes(tile) ? "Owned" : adjacent(owned, tile) ? "Available" : "Out of reach"}
@@ -112,9 +127,13 @@ export function LayersPanel({
   layer,
   setLayer,
   data,
+  traffic,
+  focusRoad,
 }: {
   layer: Layer;
   setLayer(value: Layer): void;
+  traffic: Array<{ id: number; queued: number; admitted: number }>;
+  focusRoad(id: number): void;
   data: Summary;
 }) {
   return (
@@ -124,6 +143,7 @@ export function LayersPanel({
         <select value={layer} onChange={(event) => setLayer(event.target.value as Layer)}>
           <option value="none">Natural colors</option>
           <option value="utilities">Utilities</option>
+          <option value="traffic">Road traffic</option>
           <option value="transit">Transit</option>
           <option value="value">Land value</option>
           <option value="noise">Noise</option>
@@ -154,6 +174,37 @@ export function LayersPanel({
               ))}
             </tbody>
           </table>
+        </>
+      ) : layer === "traffic" ? (
+        <>
+          <p>
+            Gold marks waiting road cohorts. Red marks queues of five or more. Counts come from the
+            latest day.
+          </p>
+          {traffic.length ? (
+            <table>
+              <thead>
+                <tr>
+                  <th>Road</th>
+                  <th>Waiting</th>
+                  <th>Entered</th>
+                </tr>
+              </thead>
+              <tbody>
+                {traffic.map((row) => (
+                  <tr key={row.id}>
+                    <td>
+                      <button onClick={() => focusRoad(row.id)}>Road {row.id}</button>
+                    </td>
+                    <td>{row.queued}</td>
+                    <td>{row.admitted}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          ) : (
+            <p>No trips are queued.</p>
+          )}
         </>
       ) : layer === "transit" ? (
         <>

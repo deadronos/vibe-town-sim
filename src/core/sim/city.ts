@@ -1,10 +1,12 @@
 import { contains, distance, height, landId, mix, type Point } from "../world/terrain.ts";
 import {
   addRoad,
+  BRIDGE_COST,
   closestPoint,
   nearestRoad,
   segmentElevation,
   roadLength,
+  roadConflict,
   snap,
   streets,
   type Road,
@@ -34,6 +36,7 @@ import {
   adjacent,
   LAND_COST,
   newRegion,
+  publicServices,
   vehicles,
   type LineKind,
   type RegionalCity,
@@ -56,6 +59,7 @@ export type Command =
   | { kind: "facility"; at: Point; service: Service }
   | { kind: "tax"; rate: number }
   | { kind: "gateway"; roadId: number }
+  | { kind: "refinance" }
   | { kind: "purchase"; tile: string }
   | { kind: "district"; tile: string; name: string; tax: number; budget: number }
   | { kind: "stop"; at: Point }
@@ -76,6 +80,8 @@ export function createCity(seed: number): City {
     region: newRegion(),
     tax: 9,
     gateway: 0,
+    debt: 0,
+    refinancing: false,
     parcels: [],
     facilities: [],
     nodes: [],
@@ -175,6 +181,9 @@ export function restore(raw: unknown): City {
     !Number.isInteger(city.tax) ||
     city.tax < 0 ||
     city.tax > 30 ||
+    typeof city.refinancing !== "boolean" ||
+    !Number.isSafeInteger(city.debt) ||
+    city.debt < 0 ||
     (city.gateway !== 0 && !city.roads.some((road) => road.id === city.gateway)) ||
     !economy ||
     !Array.isArray(economy.trips) ||
@@ -187,6 +196,8 @@ export function restore(raw: unknown): City {
       economy.receipts,
       economy.expenses,
       economy.consumed,
+      economy.lastSales,
+      economy.salesAtMonthStart,
       economy.produced,
       economy.imported,
       economy.exported,
@@ -199,18 +210,49 @@ export function restore(raw: unknown): City {
     ].every((value) => Number.isSafeInteger(value) && value >= 0)
   )
     throw new Error("Invalid economic checkpoint");
-  const parcelIds = new Set(
-    city.parcels.filter((parcel) => parcel.built).map((parcel) => parcel.id),
+  const built = new Map(
+    city.parcels.filter((parcel) => parcel.built).map((parcel) => [parcel.id, parcel]),
   );
-  for (const account of [...Object.values(economy.households), ...Object.values(economy.firms)]) {
+  const parcelIds = new Set(built.keys());
+  for (const [id, home] of Object.entries(economy.households)) {
+    const parcel = home && built.get(home.id);
     if (
-      !account ||
-      !parcelIds.has(account.id) ||
-      !Number.isSafeInteger(account.money) ||
-      account.money < 0
-    ) {
-      throw new Error("Invalid business or household account");
-    }
+      !parcel ||
+      String(home.id) !== id ||
+      !nonnegative(home.money, home.residents, home.workers, home.income, home.rent) ||
+      home.residents !== zones[parcel.zone].residents ||
+      !home.residents ||
+      home.workers > home.residents
+    )
+      throw new Error("Invalid household account");
+  }
+  for (const [id, firm] of Object.entries(economy.firms)) {
+    const parcel = firm && built.get(firm.id);
+    if (
+      !parcel ||
+      String(firm.id) !== id ||
+      !nonnegative(firm.money, firm.jobs, firm.staff, firm.inventory) ||
+      firm.jobs !== zones[parcel.zone].jobs ||
+      !firm.jobs ||
+      firm.staff > firm.jobs
+    )
+      throw new Error("Invalid business account");
+  }
+  if (
+    !Object.values(economy.balances).every(Number.isSafeInteger) ||
+    Object.values(economy.balances).reduce((sum, amount) => sum + amount, 0) !== 0 ||
+    city.cash !== 280_000 + economy.receipts - economy.expenses ||
+    (economy.balances.city ?? 0) !== economy.receipts - economy.expenses
+  )
+    throw new Error("Invalid city ledger balance");
+  for (const posting of economy.ledger) {
+    if (
+      !posting ||
+      !nonnegative(posting.tick, posting.amount) ||
+      posting.tick > city.tick ||
+      ![posting.from, posting.to, posting.purpose].every((value) => typeof value === "string")
+    )
+      throw new Error("Invalid ledger posting");
   }
   const roadIds = new Set(city.roads.map((road) => road.id));
   if (
@@ -222,6 +264,25 @@ export function restore(raw: unknown): City {
     !city.region.visited
   )
     throw new Error("Invalid regional services");
+  if (
+    !publicServices.every((service) => nonnegative(city.region.response[service])) ||
+    !Object.values(city.region.visited).every((day) => nonnegative(day) && day <= city.tick)
+  )
+    throw new Error("Invalid service records");
+  for (const [tile, district] of Object.entries(city.region.districts)) {
+    if (
+      !city.land.includes(tile) ||
+      !district ||
+      typeof district.name !== "string" ||
+      !district.name.trim() ||
+      district.name.length > 40 ||
+      !nonnegative(district.tax, district.budget) ||
+      district.tax > 30 ||
+      district.budget > 150
+    ) {
+      throw new Error("Invalid district policy");
+    }
+  }
   for (const stop of city.region.stops) {
     if (!validPoint(stop) || !roadIds.has(stop.roadId) || !validIdentity(stop.id, city, ids))
       throw new Error("Invalid stop");
@@ -245,8 +306,14 @@ export function restore(raw: unknown): City {
   for (const trip of economy.trips) {
     if (
       !trip ||
-      !(trip.kind === "dispatch" ? facilityIds.has(trip.from) : parcelIds.has(trip.from)) ||
-      !parcelIds.has(trip.to) ||
+      !(trip.kind === "dispatch"
+        ? facilityIds.has(trip.from)
+        : trip.kind === "import"
+          ? city.gateway === trip.from
+          : parcelIds.has(trip.from)) ||
+      !(trip.kind === "export" || trip.kind === "outside-job"
+        ? city.gateway === trip.to
+        : parcelIds.has(trip.to)) ||
       !Array.isArray(trip.edges) ||
       !trip.edges.every((id) => roadIds.has(id)) ||
       !Number.isSafeInteger(trip.edge) ||
@@ -256,7 +323,9 @@ export function restore(raw: unknown): City {
       trip.due < 0 ||
       !Number.isSafeInteger(trip.quantity) ||
       trip.quantity < 1 ||
-      !["commute", "shopping", "shipment", "dispatch"].includes(trip.kind) ||
+      !["commute", "shopping", "shipment", "dispatch", "export", "import", "outside-job"].includes(
+        trip.kind,
+      ) ||
       (trip.mode !== "road" &&
         !city.region.lines.some((line) => line.id === trip.line && line.kind === trip.mode)) ||
       !validIdentity(trip.id, city, ids)
@@ -264,6 +333,27 @@ export function restore(raw: unknown): City {
       throw new Error("Invalid trip");
     ids.add(trip.id);
   }
+  const cargo = economy.trips
+    .filter((trip) => trip.kind === "shipment" || trip.kind === "export")
+    .reduce((sum, trip) => sum + trip.quantity, 0);
+  const inventory = Object.values(economy.firms).reduce((sum, firm) => sum + firm.inventory, 0);
+  if (
+    economy.produced + economy.imported !==
+    economy.consumed + economy.exported + economy.scrapped + cargo + inventory
+  ) {
+    throw new Error("Invalid inventory balance");
+  }
+  const escrow = economy.trips.reduce(
+    (sum, trip) =>
+      sum +
+      (trip.kind === "shipment"
+        ? trip.quantity * 2
+        : trip.kind === "import"
+          ? trip.quantity * 3
+          : 0),
+    0,
+  );
+  if (escrow !== (economy.balances.cargo ?? 0)) throw new Error("Invalid freight escrow");
   return snapshot(city);
 }
 
@@ -319,8 +409,12 @@ export function execute(city: City, command: Command): Result {
         previous = point;
       }
     }
-    const cost = Math.round(length * (streets[command.road].cost + (command.bridge ? 90 : 0)));
+    const cost = Math.round(
+      length * (streets[command.road].cost + (command.bridge ? BRIDGE_COST : 0)),
+    );
     if (city.cash < cost) return reject("Insufficient construction funds");
+    const conflict = roadConflict(points, city.roads);
+    if (conflict) return reject(conflict);
     if (distance(points[0], points.at(-1)!) < 1) return reject("Road endpoints must differ");
     const replaced = addRoad(city, points, command.road, !!command.bridge);
     for (const parcel of city.parcels) {
@@ -352,6 +446,10 @@ export function execute(city: City, command: Command): Result {
     if (city.cash < cost) return reject("Insufficient upgrade funds");
     transfer(city, "city", "regional", cost, "Road upgrade");
     road.kind = command.road;
+    if (city.gateway === road.id && road.kind !== "highway") {
+      city.gateway = 0;
+      synchronizeEconomy(city, planner(city));
+    }
   } else if (command.kind === "zone") {
     const road = city.roads.find((road) => road.id === command.roadId);
     if (
@@ -418,6 +516,12 @@ export function execute(city: City, command: Command): Result {
     if (!road.points.some((point) => point.x < -1_750 || point.z < -1_750))
       return reject("Connect a highway to the western or southern starter-area boundary");
     city.gateway = road.id;
+  } else if (command.kind === "refinance") {
+    if (city.cash > 12_000 || city.refinancing)
+      return reject("Recovery loan is available once when cash falls below $12,000");
+    city.debt = 45_000;
+    city.refinancing = true;
+    transfer(city, "regional", "city", 40_000, "Recovery loan");
   } else if (command.kind === "purchase") {
     if (!adjacent(city.land, command.tile)) return reject("Choose unowned land next to your city");
     if (city.cash < LAND_COST) return reject("Insufficient land purchase funds");
@@ -487,7 +591,7 @@ export function execute(city: City, command: Command): Result {
   }
   if (command.kind === "road" || command.kind === "demolish")
     synchronizeEconomy(city, planner(city));
-  city.revision++;
+  city.revision += command.kind === "step" ? command.count : 1;
   return { ok: true, revision: city.revision };
 }
 
@@ -500,4 +604,8 @@ function frontagePoint(point: Point, road: Road): Point {
 
 function validIdentity(id: number, city: City, ids: Set<number>): boolean {
   return Number.isSafeInteger(id) && id > 0 && id < city.nextId && !ids.has(id);
+}
+
+function nonnegative(...values: number[]): boolean {
+  return values.every((value) => Number.isSafeInteger(value) && value >= 0);
 }

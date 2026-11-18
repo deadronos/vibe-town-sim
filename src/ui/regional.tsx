@@ -1,7 +1,14 @@
 import { useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { createRoot } from "react-dom/client";
 import { distance, landId, mix, type Point } from "../core/world/terrain.ts";
-import { roadLength, streets, type Road, type RoadClass } from "../core/network/roads.ts";
+import {
+  BRIDGE_COST,
+  roadLength,
+  segmentElevation,
+  streets,
+  type Road,
+  type RoadClass,
+} from "../core/network/roads.ts";
 import {
   services,
   zones,
@@ -33,21 +40,28 @@ let panel: Panel = {
   population: 0,
   economy: null,
   region: null,
+  debt: 0,
+  refinancing: false,
 };
 const listeners = new Set<() => void>();
 const pending = new Map<number, (reply: Reply) => void>();
-let viewport: ReturnType<typeof createViewport> | undefined;
+let viewport: Awaited<ReturnType<typeof createViewport>> | undefined;
 let lastScene: Extract<Reply, { kind: "scene" }>["scene"] | undefined;
 let nextId = 1;
+let poses: Float32Array | undefined;
 
 worker.onmessage = ({ data }: MessageEvent<Reply>) => {
   if (data.version !== PROTOCOL) return;
   if (data.kind === "panel") {
     panel = data.panel;
+    viewport?.traffic(panel.economy?.roadQueues ?? []);
     for (const listener of listeners) listener();
   } else if (data.kind === "scene") {
     lastScene = data.scene;
     viewport?.update(data.scene);
+  } else if (data.kind === "vehicles") {
+    poses = data.poses;
+    viewport?.vehicles(poses);
   } else {
     pending.get(data.id)?.(data);
     pending.delete(data.id);
@@ -102,7 +116,10 @@ function App() {
   const [side, setSide] = useState<Side>("both");
   const [brush, setBrush] = useState(false);
   const [service, setService] = useState<Service>("power");
-  const [notice, setNotice] = useState("Choose Road to start building.");
+  const [notice, setNotice] = useState("Choose a building, road or tool to begin.");
+  const [opening, setOpening] = useState("7");
+  const [previewData, setPreviewData] = useState<{ length: number; grade: number; cost: number }>();
+  const onHover = useRef<(point?: Point, id?: number) => void>(() => {});
   const [speed, setSpeed] = useState<0 | 1 | 4 | 16>(0);
   const [overview, setOverview] = useState(false);
   const canvas = useRef<HTMLCanvasElement>(null);
@@ -174,13 +191,7 @@ function App() {
       viewport?.preview(vertices, bridge);
       return;
     }
-    let points = vertices;
-    if (tool === "curve") {
-      points = Array.from({ length: 13 }, (_, i) => {
-        const t = i / 12;
-        return mix(mix(vertices[0], vertices[1], t), mix(vertices[1], vertices[2], t), t);
-      });
-    }
+    const points = gesture(vertices);
     if (
       await request(
         { kind: "command", command: { kind: "road", points, road, bridge } },
@@ -192,20 +203,100 @@ function App() {
     viewport?.preview([], bridge);
   };
 
-  useEffect(() => {
-    try {
-      viewport = createViewport(
-        canvas.current!,
-        (point, roadId) => onMap.current(point, roadId),
-        params.has("benchmark"),
-      );
-      if (lastScene) viewport.update(lastScene);
-      if (params.has("benchmark")) Object.assign(window, { regionalBenchmark: viewport });
-    } catch (error) {
-      setNotice(`Viewport unavailable. ${(error as Error).message}`);
+  onHover.current = (point, id) => {
+    if (canvas.current) canvas.current.style.cursor = id === undefined ? "crosshair" : "pointer";
+    if (!anchor.length || (tool !== "straight" && tool !== "curve")) return;
+    if (!point) {
+      viewport?.preview([], bridge);
+      setPreviewData(undefined);
+      return;
     }
-    void send({ kind: "initialize", seed: Number(params.get("seed") ?? 7) });
-    return () => viewport?.dispose();
+    const points = gesture([...anchor, point]);
+    const length = roadLength(points);
+    if (length < 1) return;
+    let grade = 0;
+    for (let i = 1; i < points.length; i++) {
+      const meters = distance(points[i - 1], points[i]);
+      const divisions = Math.max(1, Math.ceil(meters / 12));
+      for (let j = 1; j <= divisions; j++) {
+        grade = Math.max(
+          grade,
+          Math.abs(
+            segmentElevation(city.seed, points, i, j / divisions, bridge) -
+              segmentElevation(city.seed, points, i, (j - 1) / divisions, bridge),
+          ) /
+            (meters / divisions),
+        );
+      }
+    }
+    viewport?.preview(points, bridge, grade <= 0.19);
+    setPreviewData({
+      length,
+      grade,
+      cost: Math.round(length * (streets[road].cost + (bridge ? BRIDGE_COST : 0))),
+    });
+  };
+
+  function gesture(vertices: Point[]): Point[] {
+    if (tool !== "curve" || vertices.length < 3) return vertices;
+    return Array.from({ length: 13 }, (_, i) => {
+      const t = i / 12;
+      return mix(mix(vertices[0], vertices[1], t), mix(vertices[1], vertices[2], t), t);
+    });
+  }
+
+  useEffect(() => {
+    const benchmark = params.has("benchmark");
+    let disposed = false;
+    void createViewport(
+      canvas.current!,
+      (point, roadId) => onMap.current(point, roadId),
+      benchmark,
+      benchmark && params.get("backend") === "webgpu" ? "webgpu" : "webgl",
+      (point, id) => onHover.current(point, id),
+    )
+      .then((view) => {
+        if (disposed) {
+          view.dispose();
+          return;
+        }
+        viewport = view;
+        if (lastScene) view.update(lastScene);
+        if (poses) view.vehicles(poses);
+        view.traffic(panel.economy?.roadQueues ?? []);
+        if (benchmark) Object.assign(window, { regionalBenchmark: view });
+        if (params.has("qa"))
+          Object.assign(window, { regionalQA: { view, send, tick: () => panel.tick } });
+      })
+      .catch((error) => {
+        if (!disposed) setNotice(`Viewport unavailable. ${(error as Error).message}`);
+      });
+    void (async () => {
+      if (!benchmark && !params.has("seed") && !params.has("empty") && !params.has("qa")) {
+        try {
+          const saved = await readCheckpoint();
+          if (saved && !disposed) {
+            const reply = await send({ kind: "restore", checkpoint: saved });
+            if (reply.kind === "ack" && reply.result.ok) {
+              setNotice("Regional checkpoint restored");
+              return;
+            }
+          }
+        } catch (error) {
+          setNotice(`Saved checkpoint could not be opened. ${(error as Error).message}`);
+        }
+      }
+      if (!disposed)
+        await send({
+          kind: "initialize",
+          seed: Number(params.get("seed") ?? 7),
+          empty: benchmark || params.has("empty"),
+        });
+    })();
+    return () => {
+      disposed = true;
+      viewport?.dispose();
+    };
   }, []);
 
   function choose(next: typeof tool) {
@@ -227,6 +318,7 @@ function App() {
     setEconomyOpen(false);
     setSelection(undefined);
     setAnchor([]);
+    setPreviewData(undefined);
     viewport?.preview([], bridge);
   }
 
@@ -343,14 +435,20 @@ function App() {
               <dd>
                 {stats.staff} / {stats.jobs}
               </dd>
+              <dt>Reachable local jobs</dt>
+              <dd>{stats.reachableJobs}</dd>
+              <dt>Household purchasing power</dt>
+              <dd>{stats.affordability}%</dd>
+              <dt>Vacant housing lots</dt>
+              <dd>{stats.housingVacancies}</dd>
               <dt>Household workers</dt>
               <dd>{stats.workers}</dd>
               <dt>Household savings</dt>
               <dd>${stats.savings.toLocaleString()}</dd>
               <dt>Undeveloped lots</dt>
               <dd>{stats.vacancies}</dd>
-              <dt>Goods sold</dt>
-              <dd>{stats.consumed}</dd>
+              <dt>Goods sold last month</dt>
+              <dd>{stats.lastSales}</dd>
               <dt>Deliveries received</dt>
               <dd>{stats.shipments}</dd>
               <dt>Waiting for roads</dt>
@@ -390,6 +488,12 @@ function App() {
             >
               Apply taxes
             </button>
+            {city.debt > 0 && <p>Recovery loan balance ${"{city.debt.toLocaleString()}"}</p>}
+            {city.cash <= 12_000 && !city.refinancing && (
+              <button onClick={() => void run({ kind: "refinance" }, "Recovery loan issued")}>
+                Take a $40,000 recovery loan
+              </button>
+            )}
             <details>
               <summary>Recent ledger</summary>
               <ul>
@@ -402,13 +506,15 @@ function App() {
             </details>
           </>
         ) : tool === "land" && city.region ? (
-          <LandPanel owned={city.owned} tile={tile} data={city.region} run={run} />
+          <LandPanel seed={city.seed} owned={city.owned} tile={tile} data={city.region} run={run} />
         ) : tool === "transit" && city.region ? (
           <TransitPanel data={city.region} run={run} />
         ) : tool === "layers" && city.region ? (
           <LayersPanel
             data={city.region}
             layer={layer}
+            traffic={stats?.roadQueues ?? []}
+            focusRoad={(id) => viewport?.focusRoad(id)}
             setLayer={(value) => {
               setLayer(value);
               viewport?.layer(value);
@@ -595,8 +701,78 @@ function App() {
                   ? "Choose the curve control point."
                   : "Choose the road endpoint."}
             </p>
-            {anchor.length === 2 && <p>First leg {Math.round(distance(anchor[0], anchor[1]))} m</p>}
+            {previewData && (
+              <dl>
+                <dt>Length</dt>
+                <dd>{Math.round(previewData.length)} m</dd>
+                <dt>Peak grade</dt>
+                <dd>{Math.round(previewData.grade * 100)}%</dd>
+                <dt>Expected cost</dt>
+                <dd>${"{previewData.cost.toLocaleString()}"}</dd>
+              </dl>
+            )}
           </>
+        )}
+        {tool === "inspect" && !selection && !economyOpen && (
+          <details>
+            <summary>City objectives</summary>
+            <ul>
+              <li>
+                {city.roadCount ? "Road network connected" : "Build a street on dry owned land"}
+              </li>
+              <li>
+                {city.houses
+                  ? "First buildings occupied"
+                  : "Zone a street and connect power, water, and sewage"}
+              </li>
+              <li>
+                {city.region?.utility.some((item) => item.shortage)
+                  ? "Open Layers → Utilities to resolve shortages"
+                  : "Check utility capacity before expanding"}
+              </li>
+              <li>
+                {city.owned.length > 1
+                  ? "Regional land acquired"
+                  : "Use Land to purchase the tile across the river"}
+              </li>
+              <li>
+                {city.region?.lines.length
+                  ? "Transit in operation"
+                  : "Place two connected stops and open a bus line"}
+              </li>
+            </ul>
+          </details>
+        )}
+        {tool === "inspect" && !selection && !economyOpen && (
+          <details>
+            <summary>Start a new city</summary>
+            <label>
+              Opening{" "}
+              <select value={opening} onChange={(event) => setOpening(event.target.value)}>
+                <option value="7">Juniper Reach · industry</option>
+                <option value="31">Cedar Crossing · commuters</option>
+                <option value="empty-7">Juniper Reach · empty sandbox</option>
+                <option value="empty-31">Cedar Crossing · empty sandbox</option>
+              </select>
+            </label>
+            <button
+              onClick={async () => {
+                const empty = opening.startsWith("empty-");
+                const seed = Number(empty ? opening.slice(6) : opening);
+                await send({ kind: "speed", speed: 0 });
+                if (await request({ kind: "initialize", seed, empty }, "New city opened")) {
+                  setSpeed(0);
+                  setOverview(false);
+                  viewport?.overview(false);
+                }
+              }}
+            >
+              Start selected opening
+            </button>
+            <p>
+              <a href="./index.html">Juniper Bay classic</a>
+            </p>
+          </details>
         )}
         <div className="file-actions">
           <button onClick={() => void save(false)}>Save</button>

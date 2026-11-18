@@ -1,5 +1,7 @@
 import { distance, height, mix, WATER, type Point } from "../world/terrain.ts";
 
+export const BRIDGE_COST = 65;
+
 export const streets = {
   street: { width: 13, speed: 28, capacity: 6, cost: 19, sidewalks: true },
   avenue: { width: 23, speed: 46, capacity: 14, cost: 34, sidewalks: true },
@@ -206,4 +208,35 @@ export function roadComponents(network: Network): Map<number, number> {
     if (a !== b) parents.set(Math.max(a, b), Math.min(a, b));
   }
   return new Map(network.roads.map((road) => [road.id, root(road.a)]));
+}
+
+function collinearOverlap(a: Point, b: Point, c: Point, d: Point): boolean {
+  const x = b.x - a.x;
+  const z = b.z - a.z;
+  const length = distance(a, b);
+  const cross = (p: Point) => Math.abs(x * (p.z - a.z) - z * (p.x - a.x)) / length;
+  if (cross(c) > 0.01 || cross(d) > 0.01) return false;
+  const projection = (p: Point) => (x * (p.x - a.x) + z * (p.z - a.z)) / length;
+  const ends = [projection(c), projection(d)].sort((first, next) => first - next);
+  return Math.min(length, ends[1]) - Math.max(0, ends[0]) > 0.05;
+}
+
+export function roadConflict(points: Point[], roads: Road[]): string | undefined {
+  for (let i = 1; i < points.length; i++) {
+    for (let j = 1; j < i; j++) {
+      const a = points[i - 1];
+      const b = points[i];
+      const c = points[j - 1];
+      const d = points[j];
+      if (collinearOverlap(a, b, c, d) || (j < i - 1 && intersect(a, b, c, d)))
+        return "A road cannot cross itself";
+    }
+    for (const road of roads) {
+      for (let j = 1; j < road.points.length; j++) {
+        if (collinearOverlap(points[i - 1], points[i], road.points[j - 1], road.points[j])) {
+          return "A carriageway already occupies this alignment";
+        }
+      }
+    }
+  }
 }

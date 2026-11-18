@@ -47,3 +47,14 @@ If the game cannot read a save, it protects the original and lets you play tempo
 | Undo construction in the current month | Ctrl/Cmd+Z or Town menu                        |
 
 The toolbar scrolls horizontally on small screens. Touch users can switch to the pointer tool to pan and use the Orbit tool to rotate and tilt with one finger.
+
+## Regional preview
+
+Open [the regional preview](http://127.0.0.1:4173/regional.html) or follow **Play the regional preview** from the classic game. Juniper Reach opens with an industrial town. **Start a new city** offers Cedar Crossing, a commuter-focused map, and empty sandboxes on either seed. **City objectives** lists the next construction and expansion steps. Use **Land** to select a neighboring tile and preview acquisition and upkeep.
+
+- **Road** uses a start and end point. **Curve** adds a control point. The road inspector offers upgrades, and the bridge option supports water crossings.
+- **Zone** paints one or both sides of a road. The brush applies zoning near the pointer. New development needs power, potable water and sewage service. **Layers** shows these networks, traffic queues, transit, noise, pollution and land value.
+- **Transit** puts stops on streets or avenues. Select at least two stops in route order before opening a bus or tram line.
+- Regional **Save** writes an isolated IndexedDB checkpoint. The regional game opens the saved checkpoint on a normal reload. **Export** downloads a JSON checkpoint and **Import** validates it before replacing the active session. Classic saves use their existing storage and recovery controls.
+
+[Regional implementation and verification notes](docs/rewrite-plan/regional-preview.md) list benchmark commands and the current preview limits.

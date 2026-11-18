@@ -6,7 +6,7 @@ import type { Road } from "../core/network/roads.ts";
 
 export const PROTOCOL = 1;
 export type Request = { id: number; version: 1 } & (
-  | { kind: "initialize"; seed: number }
+  | { kind: "initialize"; seed: number; empty?: boolean }
   | { kind: "command"; command: Command }
   | { kind: "speed"; speed: 0 | 1 | 4 | 16 }
   | { kind: "restore"; checkpoint: unknown }
@@ -23,6 +23,8 @@ export interface Panel {
   population: number;
   economy: ReturnType<typeof economicSummary> | null;
   region: ReturnType<typeof regionSummary> | null;
+  debt: number;
+  refinancing: boolean;
   owned: string[];
 }
 export interface Scene {
@@ -39,6 +41,7 @@ export type Reply = { version: 1 } & (
   | { kind: "ack"; id: number; result: Result }
   | { kind: "panel"; panel: Panel }
   | { kind: "scene"; scene: Scene }
+  | { kind: "vehicles"; poses: Float32Array }
   | { kind: "checkpoint"; id: number; checkpoint: City }
   | {
       kind: "selection";

@@ -1,5 +1,5 @@
 import { distance, landId, type Point } from "../world/terrain.ts";
-import { roadComponents } from "../network/roads.ts";
+import { closestPoint, roadComponents } from "../network/roads.ts";
 import {
   utilityAccess,
   utilityDemand,
@@ -177,7 +177,8 @@ export function fields(
   for (const lot of sources) pollution += Math.max(0, 1 - distance(lot, at) / 230) * 15;
   let noise = pollution * 0.5;
   for (const road of city.roads) {
-    for (const point of road.points) {
+    for (let edge = 1; edge < road.points.length; edge++) {
+      const point = closestPoint(at, road.points[edge - 1], road.points[edge]).point;
       noise = Math.max(
         noise,
         Math.max(0, 1 - distance(point, at) / 150) * (road.kind === "street" ? 25 : 60),

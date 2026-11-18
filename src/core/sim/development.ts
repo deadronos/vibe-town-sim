@@ -47,6 +47,7 @@ export interface Development extends Network {
   land: string[];
   parcels: Parcel[];
   facilities: Facility[];
+  region?: { districts: Record<string, { budget: number }> };
 }
 
 export function frontage(
@@ -120,7 +121,8 @@ export function utilityAccess(city: Development, components = roadComponents(cit
       continue;
     const capacity = byComponent.get(component) ?? { power: 0, water: 0, sewage: 0 };
     const service = facility.service as Utility;
-    capacity[service] += services[service].capacity;
+    const budget = city.region?.districts[landId(facility)]?.budget ?? 100;
+    capacity[service] += Math.floor((services[service].capacity * budget) / 100);
     byComponent.set(component, capacity);
   }
   return byComponent;

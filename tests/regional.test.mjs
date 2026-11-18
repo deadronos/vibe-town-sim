@@ -224,3 +224,83 @@ test("river expansion adds service demand and a bus moves queued commuter cohort
   assert.equal(city.region.districts["2,1"].name, "East Bank");
   assert.deepEqual(restore(snapshot(city)), city);
 });
+
+test("both populated openings replay for the first ten years and survive failed replacement", async () => {
+  const { createOpening } = await import("../src/core/sim/openings.ts");
+  for (const seed of [7, 31]) {
+    const start = createOpening(seed);
+    assert.ok(Object.keys(start.economy.households).length > 10);
+    assert.ok(start.gateway);
+    assert.ok(start.cash > 50_000);
+    let replay = restore(snapshot(start));
+    assert.throws(() =>
+      restore({
+        ...snapshot(replay),
+        economy: { ...replay.economy, firms: { 1: { id: 1, money: 0, inventory: -9 } } },
+      }),
+    );
+    for (let period = 0; period < 10; period++) {
+      assert.equal(execute(replay, { kind: "step", count: 360 }).ok, true);
+      replay = restore(snapshot(replay));
+    }
+    assert.equal(execute(start, { kind: "step", count: 3600 }).ok, true);
+    assert.deepEqual(snapshot(replay), snapshot(start));
+    assert.ok(replay.economy.receipts > 0);
+    assert.ok(replay.economy.imported + replay.economy.exported > 0);
+    assert.ok(replay.cash > 0, `Seed ${seed} ended at ${replay.cash}`);
+  }
+});
+
+test("expensive public-works opening can recover without breaking the treasury or cargo ledger", async () => {
+  const { createOpening } = await import("../src/core/sim/openings.ts");
+  const city = createOpening(7);
+  const act = (command) => {
+    const reply = execute(city, command);
+    assert.ok(reply.ok, JSON.stringify(reply));
+  };
+  for (const x of [-1100, -1040, -980, -920])
+    act({ kind: "facility", at: { x, z: -630 }, service: "school" });
+  const initialCash = city.cash;
+  act({ kind: "step", count: 720 });
+  assert.ok(city.cash < initialCash);
+  assert.ok(city.cash < 12_000);
+  act({ kind: "refinance" });
+  assert.ok(city.cash > 0);
+  const debt = city.debt;
+  city.facilities
+    .filter((facility) => facility.service === "school")
+    .forEach((facility) => act({ kind: "demolish", id: facility.id }));
+  act({ kind: "step", count: 360 });
+  assert.ok(city.debt < debt);
+  assert.equal(execute(city, { kind: "refinance" }).ok, false);
+  assert.equal(city.cash, 280_000 + city.economy.receipts - city.economy.expenses);
+  assert.equal(
+    Object.values(city.economy.balances).reduce((sum, amount) => sum + amount, 0),
+    0,
+  );
+  const cargo = city.economy.trips
+    .filter((trip) => trip.kind === "shipment" || trip.kind === "export")
+    .reduce((sum, trip) => sum + trip.quantity, 0);
+  const stock = Object.values(city.economy.firms).reduce((sum, firm) => sum + firm.inventory, 0);
+  assert.equal(
+    city.economy.produced + city.economy.imported,
+    city.economy.consumed + city.economy.exported + city.economy.scrapped + cargo + stock,
+  );
+});
+
+test("overlapping carriageways are rejected without charging the city", () => {
+  const city = createCity(7);
+  const road = (a, b) => ({
+    kind: "road",
+    road: "avenue",
+    points: [
+      { x: a, z: -600 },
+      { x: b, z: -600 },
+    ],
+  });
+  assert.equal(execute(city, road(-800, -500)).ok, true);
+  const before = snapshot(city);
+  assert.equal(execute(city, road(-680, -350)).ok, false);
+  assert.deepEqual(snapshot(city), before);
+  assert.equal(execute(city, road(-500, -350)).ok, true);
+});

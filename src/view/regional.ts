@@ -5,6 +5,8 @@ import {
   BufferAttribute,
   BufferGeometry,
   Color,
+  CylinderGeometry,
+  Fog,
   DirectionalLight,
   DoubleSide,
   GridHelper,
@@ -16,6 +18,7 @@ import {
   Mesh,
   MeshBasicMaterial,
   MeshLambertMaterial,
+  MeshStandardMaterial,
   Object3D,
   PerspectiveCamera,
   PlaneGeometry,
@@ -24,6 +27,8 @@ import {
   Vector2,
   WebGLRenderer,
 } from "three";
+import { mergeGeometries } from "three/addons/utils/BufferGeometryUtils.js";
+import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 import { CHUNK, hash, height, REGION, TILE, type Point } from "../core/world/terrain.ts";
 import { closestPoint, segmentElevation, streets, type Road } from "../core/network/roads.ts";
@@ -33,20 +38,30 @@ import { zones, type Parcel, type Facility } from "../core/sim/development.ts";
 import type { Scene } from "../worker/protocol.ts";
 
 const terrainMaterial = new MeshLambertMaterial({ vertexColors: true });
-export type Layer = "none" | "utilities" | "transit" | Field;
+export type Layer = "none" | "utilities" | "transit" | "traffic" | Field;
 
 const roadMaterial = new MeshLambertMaterial({ color: 0x4b5052, side: DoubleSide });
 const shoulderMaterial = new MeshLambertMaterial({ color: 0xb1a799, side: DoubleSide });
 
-export function createViewport(
+export async function createViewport(
   canvas: HTMLCanvasElement,
   click: (point: Point, roadId?: number) => void,
   benchmark: boolean,
+  backend: "webgl" | "webgpu" = "webgl",
+  hover?: (point?: Point, id?: number) => void,
 ) {
-  const renderer = new WebGLRenderer({ canvas, antialias: true });
+  const started = performance.now();
+  const renderer =
+    backend === "webgpu"
+      ? new (await import("three/webgpu")).WebGPURenderer({ canvas, antialias: true })
+      : new WebGLRenderer({ canvas, antialias: true });
+  if ("init" in renderer) await renderer.init();
+  const actualBackend =
+    "backend" in renderer && "isWebGPUBackend" in renderer.backend ? "webgpu" : "webgl";
   renderer.setPixelRatio(Math.min(devicePixelRatio, 1.5));
   const scene = new ThreeScene();
   scene.background = new Color(0xa3c1c2);
+  scene.fog = new Fog(0xa3c1c2, 1_800, 12_000);
   scene.add(new AmbientLight(0xf0eee0, 1.7));
   const sun = new DirectionalLight(0xffe8ba, 2.1);
   sun.position.set(-150, 500, -130);
@@ -57,8 +72,8 @@ export function createViewport(
   controls.maxDistance = 8_500;
   controls.maxPolarAngle = Math.PI * 0.475;
   controls.mouseButtons = { ...controls.mouseButtons, LEFT: null };
-  controls.target.set(-680, 8, -665);
-  camera.position.set(-120, 950, 290);
+  controls.target.set(-515, 12, -700);
+  camera.position.set(-245, 440, -115);
   controls.update();
   const terrain = new Group();
   const roadGroup = new Group();
@@ -67,6 +82,10 @@ export function createViewport(
   const transit = new Group();
   scene.add(terrain, roadGroup, lotGroup, overlay, transit);
   const box = new BoxGeometry(1, 1, 1);
+  const tree = new ConeGeometry(1, 1, 6);
+  const trunk = new CylinderGeometry(0.85, 1, 1, 5);
+  const houseKit: BufferGeometry[] = [];
+  const houseMaterial = new MeshLambertMaterial({ vertexColors: true });
   const roof = new ConeGeometry(0.75, 1, 4);
   roof.rotateY(Math.PI / 4);
   const materials = new Map<number, MeshLambertMaterial>();
@@ -114,6 +133,7 @@ export function createViewport(
   let roads: Road[] = [];
   let activeLayer: Layer = "none";
   let latest: Scene | undefined;
+  let traffic: Array<{ id: number; queued: number }> = [];
   let seed: number | undefined;
   let frame = 0;
   let uploads = 0;
@@ -122,6 +142,55 @@ export function createViewport(
   let cars: InstancedMesh | undefined;
   let route: "overview" | "low" | undefined;
   let vehiclePaused = false;
+  let liveCars: InstancedMesh | undefined;
+  let vehiclePoses: Float32Array = new Float32Array();
+  let previousPoses = new Map<number, { x: number; y: number; z: number }>();
+  let poseTime = 0;
+  let foliage: [InstancedMesh, InstancedMesh] | undefined;
+  let firstRender = 0;
+  let renderedRevision = -1;
+
+  if (!benchmark) {
+    const loader = new GLTFLoader();
+    void Promise.all(
+      ["sand", "cedar", "sage"].map((name) =>
+        loader.loadAsync(`${import.meta.env.BASE_URL}region/coastal-${name}.glb`),
+      ),
+    )
+      .then((models) => {
+        for (const loaded of models) {
+          loaded.scene.updateMatrixWorld(true);
+          const parts: BufferGeometry[] = [];
+          loaded.scene.traverse((object) => {
+            if (!(object instanceof Mesh) || !(object.material instanceof MeshStandardMaterial))
+              return;
+            const geometry = (
+              object.geometry.index ? object.geometry.toNonIndexed() : object.geometry.clone()
+            ).applyMatrix4(object.matrixWorld);
+            geometry.deleteAttribute("uv");
+            const colors = new Float32Array(geometry.getAttribute("position").count * 3);
+            for (let i = 0; i < colors.length; i += 3) object.material.color.toArray(colors, i);
+            geometry.setAttribute("color", new BufferAttribute(colors, 3));
+            parts.push(geometry);
+            object.geometry.dispose();
+            object.material.dispose();
+          });
+          const merged = mergeGeometries(parts);
+          for (const part of parts) part.dispose();
+          if (merged) houseKit.push(merged);
+        }
+        if (latest) {
+          for (const parcel of latest.parcels) {
+            if (parcel.zone === "homes") lots.delete(parcel.id);
+          }
+          for (const existing of lotGroup.children.slice()) {
+            if (!lots.has(existing.userData.id)) existing.removeFromParent();
+          }
+          update(latest);
+        }
+      })
+      .catch((error) => console.warn("Coastal kit unavailable", error));
+  }
 
   function ground(x: number, z: number, divisions: number): Mesh {
     const geometry = new PlaneGeometry(CHUNK, CHUNK, divisions, divisions);
@@ -133,7 +202,12 @@ export function createViewport(
     for (let i = 0; i < positions.count; i++) {
       const elevation = height(seed!, { x: positions.getX(i), z: positions.getZ(i) });
       positions.setY(i, elevation);
-      color.set(elevation < 5 ? 0xa3a184 : 0x698c6d).multiplyScalar(0.92 + elevation / 120);
+      const greenery =
+        0.95 + 0.08 * Math.sin(positions.getX(i) / 104) * Math.sin(positions.getZ(i) / 138);
+      color
+        .set(0xa1a185)
+        .lerp(new Color(0x577f5e), Math.max(0, Math.min(1, elevation / 11)))
+        .multiplyScalar(greenery + elevation / 120);
       colors.push(color.r, color.g, color.b);
     }
     geometry.setAttribute("color", new BufferAttribute(new Float32Array(colors), 3));
@@ -186,8 +260,8 @@ export function createViewport(
       seed = model.seed;
       for (let z = -REGION / 2 + CHUNK / 2; z < REGION / 2; z += CHUNK) {
         for (let x = -REGION / 2 + CHUNK / 2; x < REGION / 2; x += CHUNK) {
-          const near = ground(x, z, 20);
-          const far = ground(x, z, 5);
+          const near = ground(x, z, 24);
+          const far = ground(x, z, 12);
           terrain.add(near, far);
           chunks.push({ near, far, x, z });
         }
@@ -240,7 +314,57 @@ export function createViewport(
       item.group.removeFromParent();
       lots.delete(id);
     }
+    if (!benchmark) drawFoliage(model);
     drawLayer();
+  }
+
+  function drawFoliage(model: Scene) {
+    const footprint = new Set<string>();
+    const mark = (x: number, z: number) =>
+      footprint.add(`${Math.round(x / 21)},${Math.round(z / 21)}`);
+    for (const lot of [...model.parcels, ...model.facilities]) mark(lot.x, lot.z);
+    for (const road of model.roads) {
+      for (let index = 1; index < road.points.length; index++) {
+        const a = road.points[index - 1];
+        const b = road.points[index];
+        const pieces = Math.ceil(Math.hypot(a.x - b.x, a.z - b.z) / 10);
+        for (let part = 0; part <= pieces; part++)
+          mark(a.x + ((b.x - a.x) * part) / pieces, a.z + ((b.z - a.z) * part) / pieces);
+      }
+    }
+    if (!foliage) {
+      foliage = [
+        new InstancedMesh(tree, material(0xffffff), 3_200),
+        new InstancedMesh(trunk, material(0x675c46), 3_200),
+      ];
+      scene.add(...foliage);
+    }
+    const [canopy, stems] = foliage;
+    let count = 0;
+    for (let index = 0; index < 3_200; index++) {
+      const local = index < 2_400;
+      const range = local ? 2_050 : 7_800;
+      const x = hash(index * 5 + model.seed) * range - range / 2 - (local ? 520 : 0);
+      const z = hash(index * 7 + model.seed + 1) * range - range / 2 - (local ? 670 : 0);
+      const y = height(model.seed, { x, z });
+      if (y < 4 || footprint.has(`${Math.round(x / 21)},${Math.round(z / 21)}`)) continue;
+      if (local && Math.sin(x / 85) * Math.sin(z / 93) < -0.25) continue;
+      const size = 6 + hash(index * 11) * 11;
+      dummy.rotation.set(0, 0, 0);
+      dummy.position.set(x, y + size / 2, z);
+      dummy.scale.set(1.5, size, 1.5);
+      dummy.updateMatrix();
+      stems.setMatrixAt(count, dummy.matrix);
+      dummy.position.y = y + size * 0.91;
+      dummy.scale.set(size * 0.36, size * 0.9, size * 0.36);
+      dummy.updateMatrix();
+      canopy.setMatrixAt(count, dummy.matrix);
+      canopy.setColorAt(count, new Color([0x2f624d, 0x47775d, 0x6e875a, 0x51704d][index % 4]));
+      count++;
+    }
+    canopy.count = stems.count = count;
+    canopy.instanceMatrix.needsUpdate = stems.instanceMatrix.needsUpdate = true;
+    canopy.instanceColor!.needsUpdate = true;
   }
 
   function drawLayer(): void {
@@ -257,6 +381,28 @@ export function createViewport(
     transit.clear();
     if (!latest || activeLayer === "none") return;
     const model = latest;
+    if (activeLayer === "traffic") {
+      const queued = new Map(traffic.map((row) => [row.id, row.queued]));
+      for (const road of model.roads) {
+        const length = queued.get(road.id);
+        if (!length) continue;
+        const points = road.points.map(
+          (point, i) =>
+            new Vector3(
+              point.x,
+              segmentElevation(model.seed, road.points, Math.max(1, i), i ? 1 : 0, road.bridge) + 4,
+              point.z,
+            ),
+        );
+        transit.add(
+          new ThreeLine(
+            new BufferGeometry().setFromPoints(points),
+            new LineBasicMaterial({ color: length >= 5 ? 0xf45c55 : 0xffcb77, depthTest: false }),
+          ),
+        );
+      }
+      return;
+    }
     if (activeLayer === "transit") {
       const router = planner({ roads: model.roads, nodes: [], nextId: 0 });
       for (const line of model.lines) {
@@ -333,6 +479,12 @@ export function createViewport(
     group.add(base);
     if ("built" in lot && !lot.built) {
       base.material = material(dimensions.color);
+      return group;
+    }
+    if ("zone" in lot && lot.zone === "homes" && houseKit.length) {
+      const dwelling = new Mesh(houseKit[lot.id % houseKit.length], houseMaterial);
+      dwelling.position.y = 0.8;
+      group.add(dwelling);
       return group;
     }
     const floors = dimensions.size * (0.85 + hash(lot.id) * 0.3);
@@ -439,7 +591,17 @@ export function createViewport(
     const picked = hit(event);
     if (picked) click(picked.point, picked.roadId);
   }
+  function handleHover(event: PointerEvent): void {
+    if (event.buttons || !hover) return;
+    const picked = hit(event);
+    hover(picked?.point, picked?.roadId);
+  }
+  function clearHover(): void {
+    hover?.();
+  }
   canvas.addEventListener("pointerup", handleClick);
+  canvas.addEventListener("pointermove", handleHover);
+  canvas.addEventListener("pointerleave", clearHover);
   const resize = new ResizeObserver(() => {
     const { clientWidth, clientHeight } = canvas;
     if (!clientWidth || !clientHeight) return;
@@ -452,7 +614,7 @@ export function createViewport(
   renderer.setAnimationLoop((time) => {
     if (last && samples.length < 2_400) samples.push(time - last);
     last = time;
-    if (route) {
+    if (route && !vehiclePaused) {
       const angle = time / 3_000;
       controls.target.set(0, 18, 0);
       const distance = route === "overview" ? 5_000 : 1_650;
@@ -481,12 +643,85 @@ export function createViewport(
       cars.instanceMatrix.needsUpdate = true;
       uploads += cars.count * 64;
     }
+    if (!benchmark && liveCars && vehiclePoses.length && poseTime !== 0) {
+      const fraction = Math.min(1, (performance.now() - poseTime) / 230);
+      if (fraction === 1) poseTime = 0;
+      for (let index = 0; index < liveCars.count; index++) {
+        const part = index * 7;
+        const x = vehiclePoses[part + 1];
+        const y = vehiclePoses[part + 2];
+        const z = vehiclePoses[part + 3];
+        const prior = previousPoses.get(vehiclePoses[part]);
+        const priorClose =
+          prior && Math.hypot(prior.x - x, prior.z - z) < 450 ? prior : { x, y, z };
+        dummy.position.set(
+          priorClose.x + (x - priorClose.x) * fraction,
+          priorClose.y + (y - priorClose.y) * fraction + 1.5,
+          priorClose.z + (z - priorClose.z) * fraction,
+        );
+        dummy.rotation.set(0, vehiclePoses[part + 4], 0);
+        dummy.scale.set(1, 1, vehiclePoses[part + 5] === 2 ? 2.25 : 1);
+        dummy.updateMatrix();
+        liveCars.setMatrixAt(index, dummy.matrix);
+      }
+      liveCars.instanceMatrix.needsUpdate = true;
+      uploads += liveCars.count * 64;
+    }
+    if (actualBackend === "webgpu") renderer.info.reset();
     renderer.render(scene, camera);
+    if (latest) renderedRevision = latest.revision;
+    if (!firstRender && seed !== undefined) firstRender = performance.now() - started;
     frame++;
   });
 
   return {
     update,
+    vehicles(poses: Float32Array) {
+      if (benchmark) return;
+      if (!liveCars) {
+        liveCars = new InstancedMesh(new BoxGeometry(3, 2, 5), material(0xffffff), 250);
+        liveCars.frustumCulled = false;
+        scene.add(liveCars);
+      }
+      previousPoses = new Map();
+      for (let i = 0; i < vehiclePoses.length; i += 7)
+        previousPoses.set(vehiclePoses[i], {
+          x: vehiclePoses[i + 1],
+          y: vehiclePoses[i + 2],
+          z: vehiclePoses[i + 3],
+        });
+      vehiclePoses = poses;
+      poseTime = performance.now();
+      liveCars.count = poses.length / 7;
+      for (let i = 0; i < liveCars.count; i++)
+        liveCars.setColorAt(i, new Color([0xd78e54, 0xd1c5a3, 0x50b3af][poses[i * 7 + 5]]));
+      if (liveCars.instanceColor) liveCars.instanceColor.needsUpdate = true;
+    },
+    project(point: Point, elevation?: number) {
+      camera.updateMatrixWorld(true);
+      const projected = new Vector3(point.x, elevation ?? height(seed!, point), point.z).project(
+        camera,
+      );
+      const rect = canvas.getBoundingClientRect();
+      return {
+        x: rect.left + ((projected.x + 1) * rect.width) / 2,
+        y: rect.top + ((1 - projected.y) * rect.height) / 2,
+      };
+    },
+    traffic(rows: Array<{ id: number; queued: number }>) {
+      if (
+        rows.length === traffic.length &&
+        rows.every((row, i) => row.id === traffic[i].id && row.queued === traffic[i].queued)
+      )
+        return;
+      traffic = rows;
+      if (activeLayer === "traffic") drawLayer();
+    },
+    focusRoad(id: number) {
+      const road = roads.find((road) => road.id === id);
+      if (!road) return;
+      this.cameraAt(road.points[Math.floor((road.points.length - 1) / 2)], "planning");
+    },
     layer(value: Layer) {
       activeLayer = value;
       drawLayer();
@@ -498,14 +733,20 @@ export function createViewport(
         tile.position.set((x + 0.5) * TILE - REGION / 2, 37, (z + 0.5) * TILE - REGION / 2);
       }
     },
-    preview(points: Point[], bridge: boolean) {
+    preview(points: Point[], bridge: boolean, valid = true) {
+      preview.material.color.set(valid ? 0xfac87a : 0xf4655e);
       preview.geometry.dispose();
       preview.geometry = ribbon(points, 12, bridge, 1.2);
     },
     overview(active: boolean) {
       grid.visible = active;
-      controls.target.set(active ? 0 : -680, 8, active ? 0 : -665);
-      camera.position.set(active ? 3400 : -120, active ? 5900 : 950, active ? 3800 : 290);
+      controls.target.set(active ? 0 : -515, 8, active ? 0 : -700);
+      camera.position.set(active ? 1700 : -245, active ? 6900 : 440, active ? 4760 : -115);
+      controls.update();
+    },
+    cameraAt(target: Point, mode: "planning" | "low") {
+      controls.target.set(target.x, 12, target.z);
+      camera.position.set(target.x - 150, mode === "planning" ? 450 : 95, target.z + 385);
       controls.update();
     },
     benchmark(nextRoute: "overview" | "low", paused = false) {
@@ -518,6 +759,9 @@ export function createViewport(
     measurements() {
       return {
         samples: [...samples],
+        firstRender,
+        renderedRevision,
+        backend: actualBackend,
         frame,
         uploads,
         calls: renderer.info.render.calls,
@@ -529,6 +773,8 @@ export function createViewport(
       resize.disconnect();
       controls.dispose();
       canvas.removeEventListener("pointerup", handleClick);
+      canvas.removeEventListener("pointermove", handleHover);
+      canvas.removeEventListener("pointerleave", clearHover);
       const geometry = new Set<BufferGeometry>();
       scene.traverse((object) => {
         if (object instanceof Mesh || object instanceof GridHelper) geometry.add(object.geometry);
