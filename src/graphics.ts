@@ -83,6 +83,7 @@ in float depth;
 flat in int parcel;
 uniform int pass;
 uniform sampler2D shadowMap;
+uniform int demolitionLot;
 out vec4 outColor;
 void main(){
   if(pass==1){outColor=vec4(1.);return;}
@@ -97,6 +98,7 @@ void main(){
         shade+=step(blocker+.00045,uv.z)/9.;
       }
     }
+    if(parcel!=0 && parcel==demolitionLot)c=mix(c,vec3(1.,.36,.12),.65);
     c*=mix(vec3(1.),vec3(.66,.73,.78),shade);
     c=mix(c,vec3(.78,.87,.86),smoothstep(24.,140.,depth)*.8);
   }
@@ -111,6 +113,7 @@ export class Renderer extends OrbitCamera {
   pass;
   shadow;
   shadowMap;
+  demolitionLot;
   pickTarget;
   constructor(public canvas: HTMLCanvasElement) {
     super();
@@ -136,6 +139,7 @@ export class Renderer extends OrbitCamera {
     this.camera = gl.getUniformLocation(p, "camera");
     this.lens = gl.getUniformLocation(p, "lens");
     this.tiltUniform = gl.getUniformLocation(p, "tilt");
+    this.demolitionLot = gl.getUniformLocation(p, "demolitionLot");
     this.pass = gl.getUniformLocation(p, "pass");
     this.shadow = gl.createFramebuffer()!;
     this.shadowMap = gl.createTexture()!;
