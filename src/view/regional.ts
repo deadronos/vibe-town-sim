@@ -1,6 +1,7 @@
 import {
   AmbientLight,
   BoxGeometry,
+  ConeGeometry,
   BufferAttribute,
   BufferGeometry,
   Color,
@@ -23,6 +24,7 @@ import {
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 import { CHUNK, hash, height, REGION, type Point } from "../core/world/terrain.ts";
 import { closestPoint, roadElevation, streets, type Road } from "../core/network/roads.ts";
+import { zones, type Parcel, type Facility } from "../core/sim/development.ts";
 import type { Scene } from "../worker/protocol.ts";
 
 const terrainMaterial = new MeshLambertMaterial({ vertexColors: true });
@@ -53,7 +55,17 @@ export function createViewport(
   controls.update();
   const terrain = new Group();
   const roadGroup = new Group();
-  scene.add(terrain, roadGroup);
+  const lotGroup = new Group();
+  scene.add(terrain, roadGroup, lotGroup);
+  const box = new BoxGeometry(1, 1, 1);
+  const roof = new ConeGeometry(0.75, 1, 4);
+  roof.rotateY(Math.PI / 4);
+  const materials = new Map<number, MeshLambertMaterial>();
+  function material(color: number) {
+    if (!materials.has(color)) materials.set(color, new MeshLambertMaterial({ color }));
+    return materials.get(color)!;
+  }
+  const lots = new Map<number, { group: Group; key: string }>();
   const water = new Mesh(
     new PlaneGeometry(REGION, REGION),
     new MeshLambertMaterial({ color: 0x327985 }),
@@ -156,6 +168,10 @@ export function createViewport(
         }
       }
       kit();
+      for (const item of roadMeshes.values()) disposeRoad(item.group);
+      roadMeshes.clear();
+      lots.clear();
+      lotGroup.clear();
     }
     roads = model.roads;
     const changed = new Set(roads.map((road) => road.id));
@@ -183,6 +199,59 @@ export function createViewport(
       roadMeshes.set(road.id, { group, key });
       roadGroup.add(group);
     }
+
+    const active = new Set<number>();
+    for (const lot of [...model.parcels, ...model.facilities]) {
+      active.add(lot.id);
+      const key = JSON.stringify(lot);
+      if (lots.get(lot.id)?.key === key) continue;
+      lots.get(lot.id)?.group.removeFromParent();
+      const group = makeLot(lot);
+      lotGroup.add(group);
+      lots.set(lot.id, { group, key });
+    }
+    for (const [id, item] of lots) {
+      if (active.has(id)) continue;
+      item.group.removeFromParent();
+      lots.delete(id);
+    }
+  }
+
+  function makeLot(lot: Parcel | Facility): Group {
+    const group = new Group();
+    group.userData.id = lot.id;
+    group.position.set(lot.x, height(seed!, lot), lot.z);
+    const dimensions = "zone" in lot ? zones[lot.zone] : { size: 10, color: 0x639f9d };
+    group.rotation.y = "angle" in lot ? lot.angle : 0;
+    const base = new Mesh(box, material(0xabb88b));
+    base.scale.set(28, 0.35, 28);
+    base.position.y = 0.6;
+    group.add(base);
+    if ("built" in lot && !lot.built) {
+      base.material = material(dimensions.color);
+      return group;
+    }
+    const floors = dimensions.size * (0.85 + hash(lot.id) * 0.3);
+    const facade = new Mesh(box, material(dimensions.color));
+    facade.scale.set(19, floors, 15);
+    facade.position.y = floors / 2 + 0.8;
+    group.add(facade);
+    const top = new Mesh(
+      dimensions.size < 14 && lot.id % 3 ? roof : box,
+      material(lot.id % 2 ? 0x675549 : 0x6e8582),
+    );
+    top.position.y = floors + 1.7;
+    top.scale.set(20, dimensions.size < 14 ? 4 : 2.4, 16);
+    group.add(top);
+    if (dimensions.size > 13) {
+      for (let base = 4; base < floors - 1; base += 4) {
+        const windows = new Mesh(box, material(0x355e63));
+        windows.scale.set(19.3, 1.45, 15.2);
+        windows.position.y = base;
+        group.add(windows);
+      }
+    }
+    return group;
   }
 
   function disposeRoad(group: Group): void {
@@ -229,7 +298,11 @@ export function createViewport(
       (-(event.clientY - rect.top) / rect.height) * 2 + 1,
     );
     ray.setFromCamera(cursor, camera);
-    const road = ray.intersectObjects(roadGroup.children, true)[0];
+    const hitEntity = ray.intersectObjects([roadGroup, lotGroup], true)[0];
+    const lot = hitEntity?.object.parent?.userData.id as number | undefined;
+    if (lot !== undefined)
+      return { point: { x: hitEntity.point.x, z: hitEntity.point.z }, roadId: lot };
+    const road = hitEntity;
     if (road) {
       const model = roads.find(
         (candidate) => roadMeshes.get(candidate.id)?.group === road.object.parent,

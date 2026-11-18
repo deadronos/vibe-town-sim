@@ -1,4 +1,5 @@
 import { createCity, execute, restore, snapshot } from "../core/sim/city.ts";
+import { zones } from "../core/sim/development.ts";
 import { PROTOCOL, type Reply, type Request } from "./protocol.ts";
 
 let city = createCity(7);
@@ -16,12 +17,22 @@ function post(
 }
 
 function publish(topology = false): void {
-  const { seed, tick, cash, revision, roads, land } = city;
+  const { seed, tick, cash, revision, roads, land, parcels, facilities } = city;
+  const buildings = parcels.filter((parcel) => parcel.built);
   post({
     kind: "panel",
-    panel: { seed, tick, cash, revision, roadCount: roads.length, owned: land },
+    panel: {
+      seed,
+      tick,
+      cash,
+      revision,
+      roadCount: roads.length,
+      owned: land,
+      houses: buildings.length,
+      population: buildings.reduce((sum, parcel) => sum + zones[parcel.zone].residents, 0),
+    },
   });
-  if (topology) post({ kind: "scene", scene: { seed, revision, roads } });
+  if (topology) post({ kind: "scene", scene: { seed, revision, roads, parcels, facilities } });
 }
 
 self.onmessage = ({ data }: MessageEvent<Request>) => {
@@ -32,14 +43,20 @@ self.onmessage = ({ data }: MessageEvent<Request>) => {
     return;
   }
   if (data.kind === "select") {
-    post({ kind: "selection", id, road: city.roads.find((road) => road.id === data.roadId) });
+    post({
+      kind: "selection",
+      id,
+      entity: [...city.roads, ...city.parcels, ...city.facilities].find(
+        (item) => item.id === data.roadId,
+      ),
+    });
     return;
   }
   try {
     if (data.kind === "command") {
       const result = execute(city, data.command);
       post({ kind: "ack", id, result });
-      if (result.ok) publish(data.command.kind !== "step");
+      if (result.ok) publish(true);
       return;
     }
     if (data.kind === "initialize") {
@@ -65,5 +82,5 @@ self.onmessage = ({ data }: MessageEvent<Request>) => {
 setInterval(() => {
   if (speed === 0) return;
   execute(city, { kind: "step", count: speed });
-  publish();
+  publish(true);
 }, 250);
